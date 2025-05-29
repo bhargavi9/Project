@@ -1,0 +1,784 @@
+# import sys
+import os
+import sys
+
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+import Constants.constants_iaas_db_queries as consts
+from DbUtils.snowflake_utility import SnowFlakeUtility
+from ExceptionUtils.exception_handling import raise_exception_globally
+from RecoveryTypeUtils.compute_target_rt_value_utility import ComputeTargetRTValueUtility
+from DbUtils.sqlserver_utility import SqlServerUtility
+import DbUtils.constants_drdb_queries as drdb_consts
+import Constants.constants_resource_cost_configuration as consts_cost
+import logging
+import pandas as pd
+import numpy as np
+
+
+class IaasDbDRConfigurationFetcher:
+    @raise_exception_globally
+    def __init__(self, project_name: str, sf_conn: SnowFlakeUtility, subscription_df: pd.DataFrame,
+                 process_date, rt_values_df):
+        self.logger = logging.getLogger(project_name)
+        self.project_name = project_name
+        self.sf_conn = sf_conn
+        self.subscription_df = subscription_df
+        self.subscription_id = ",".join([f"'{element}'" for element in
+                                         self.subscription_df['subscription_id'].tolist()])
+        self.process_date = process_date
+        self.rt_values_df = rt_values_df
+        config = dict(os.environ)
+        self.sql_server_utility = SqlServerUtility(conf=config, project_name="Ask DR server", sf_con=self.sf_conn)
+
+    @raise_exception_globally
+    def fetch_sf_iaas_db_config_daily_data(self) -> pd.DataFrame:
+        return self.sf_conn.query_to_df(consts.iaas_db_config_daily_query.format(os.environ['SF_TABLE_SCHEMA'],
+                                                                                     self.subscription_id,
+                                                                                     self.process_date), params=())
+
+    @raise_exception_globally
+    def fetch_sf_iaas_db_metrics_daily_data(self) -> pd.DataFrame:
+        """
+        This method fetches the attributes of various storage accounts for a subscription from Snowflake
+
+        :returns: Attributes of various storage accounts within a subscription
+        :rtype: pd.DataFrame
+        """
+        return self.sf_conn.query_to_df(consts.iaas_db_metrics_daily_query.format(os.environ['SF_TABLE_SCHEMA'],
+                                                                                      self.subscription_id,
+                                                                                      self.process_date), params=())
+
+    @raise_exception_globally
+    def format_nondr_resource_name_column(self, data):
+        if "-prod-" in data['subscription_name'].lower():
+            return data['resource_name']. \
+                replace("-prod-", ""). \
+                replace("prod", ""). \
+                replace(data['location'], "")
+        elif "-nprd-" in data['subscription_name'].lower():
+            return data['resource_name']. \
+                replace("-nprd-", ""). \
+                replace("-dev-", ""). \
+                replace("-test-", ""). \
+                replace(data['location'], "")
+
+    @raise_exception_globally
+    def format_dr_resource_name_column(self, data):
+        return data['resource_name']. \
+            replace("-dr-", ""). \
+            replace("dr", ""). \
+            replace("-prod-", ""). \
+            replace("prod", ""). \
+            replace(data['location'], "")
+
+    @raise_exception_globally
+    def reevaulate_mots_standby_df(self, non_determined_mots_standby_analysis_df):
+        self.logger.info("Running the logic to re-evaluate standby df")
+        self.logger.info("Running the logic to determine number of VMs per mots and region combination")
+        count_vm_df = non_determined_mots_standby_analysis_df.groupby(['mots_id', 'location'])['resource_name']. \
+            count().reset_index(name='count_vm')
+        self.logger.info("Running the logic to determine number of regions per mots")
+        count_regions_df = non_determined_mots_standby_analysis_df[['mots_id', 'location']]. \
+            drop_duplicates().groupby(['mots_id'])['location']. \
+            count().reset_index(name='count_regions')
+        # Combining the count measures with the original dataframe
+        non_determined_mots_standby_analysis_df = non_determined_mots_standby_analysis_df.merge(count_vm_df,
+                                                                                                on=["mots_id",
+                                                                                                    "location"],
+                                                                                                how="left"
+                                                                                                ). \
+            merge(count_regions_df,
+                  on=["mots_id"],
+                  how="left")
+        # Analyze those MOTS for which standby information can be determined
+        # SKUs can be compared between primary and DR regions for cases when there are 2 regions for a MOTS and each region has 1 vm
+        non_determined_mots_standby_analysis_df = non_determined_mots_standby_analysis_df.loc[
+            (non_determined_mots_standby_analysis_df['count_vm'] == 1) &
+            (non_determined_mots_standby_analysis_df['count_regions'] == 2)]
+        dr_df = non_determined_mots_standby_analysis_df.loc[non_determined_mots_standby_analysis_df['dr_flag'] == 1]
+        non_dr_df = non_determined_mots_standby_analysis_df.loc[non_determined_mots_standby_analysis_df['dr_flag'] == 0]
+        join_df = non_dr_df.merge(dr_df,
+                                  on=["mots_id", "subscription_id"],
+                                  how="outer",
+                                  suffixes=['_non_dr', '_dr'])
+        reevaulated_mots_standby_df = self.compute_standby_info(join_df)
+        reevaluated_invalid_standby_df = self.compute_invalid_standby_info(join_df)
+
+        return reevaulated_mots_standby_df, reevaluated_invalid_standby_df
+
+    @raise_exception_globally
+    def compute_invalid_standby_info(self, analysis_df):
+        analysis_df = analysis_df.copy()
+        conditions = [(~ analysis_df['resource_name_non_dr'].isna())
+                      &
+                      (~ analysis_df['resource_name_dr'].isna())
+                      &
+                      (analysis_df['vm_sku_cost_dr'] > analysis_df['vm_sku_cost_non_dr'])]
+        choices = ["invalid"]
+        analysis_df['standby_mode'] = np.select(conditions, choices, default=0)
+        invalid_standby_df = analysis_df.loc[analysis_df['standby_mode'] == 'invalid']
+        invalid_standby_df = invalid_standby_df[['mots_id',
+                                                 'subscription_id',
+                                                 'resource_name_dr',
+                                                 'sku_name_non_dr']].drop_duplicates()
+        invalid_standby_df = invalid_standby_df.rename(columns={'resource_name_dr': 'resource_name',
+                                                                'sku_name_non_dr': 'expected_sku_name'})
+        invalid_standby_df['invalid_standby_flag'] = 1
+        return invalid_standby_df
+
+    # @raise_exception_globally
+    # def compute_invalid_number_of_workers_info(self, analysis_df):
+    #     # Mark app service plans with dr workers count greater than prod workers count
+    #     conditions = [(~ analysis_df['resource_name_non_dr'].isna())
+    #                   &
+    #                   (~ analysis_df['resource_name_dr'].isna())
+    #                   &
+    #                   (analysis_df['current_number_of_workers_dr'] > analysis_df['current_number_of_workers_non_dr'])]
+    #     choices = [1]
+    #     analysis_df['invalid_number_of_workers_flag'] = np.select(conditions, choices, default=0)
+    #     invalid_number_of_workers_df = analysis_df.loc[analysis_df['invalid_number_of_workers_flag'] == 1]
+    #     invalid_number_of_workers_df = invalid_number_of_workers_df[['mots_id',
+    #                                                                  'subscription_id',
+    #                                                                  'resource_name_dr']].drop_duplicates()
+    #     invalid_number_of_workers_df = invalid_number_of_workers_df.rename(columns={'resource_name_dr':
+    #                                                                                     'resource_name'})
+    #     invalid_number_of_workers_df['invalid_number_of_workers_flag'] = 1
+    #     # invalid_number_of_workers_df.to_csv("invalid_number_of_workers_df.csv")
+    #     # Return all three dataframes created in this method
+    #     return invalid_number_of_workers_df
+
+    @raise_exception_globally
+    def compute_standby_info(self, analysis_df):
+        analysis_df = analysis_df.copy()
+        conditions = [(~ analysis_df['resource_name_non_dr'].isna())
+                      &
+                      (~ analysis_df['resource_name_dr'].isna())
+                      &
+                      (analysis_df['vm_sku_cost_dr'] < analysis_df['vm_sku_cost_non_dr']),
+                      (~ analysis_df['resource_name_non_dr'].isna())
+                      &
+                      (~ analysis_df['resource_name_dr'].isna())
+                      &
+                      (analysis_df['vm_sku_cost_dr'] == analysis_df['vm_sku_cost_non_dr']),
+                      (~ analysis_df['resource_name_non_dr'].isna())
+                      &
+                      (~ analysis_df['resource_name_dr'].isna())
+                      &
+                      (analysis_df['vm_sku_cost_dr'] > analysis_df['vm_sku_cost_non_dr']),
+                      (analysis_df['resource_name_non_dr'].isna())
+                      |
+                      (analysis_df['resource_name_dr'].isna())
+                      ]
+        choices = ["warm", "hot", "invalid", "cannot determine"]
+        analysis_df['standby_mode'] = np.select(conditions, choices)
+        # Rank the app service plans within subscription
+        conditions = [analysis_df['standby_mode'] == "warm",
+                      analysis_df['standby_mode'] == "hot",
+                      analysis_df['standby_mode'] == "invalid",
+                      analysis_df['standby_mode'] == "cannot determine"
+                      ]
+        choices = [1, 2, 3, 4]
+        analysis_df['standby_rank'] = np.select(conditions, choices)
+        # Further rank the data so that the highest of all 4 is taken for every mots
+        # Hence, if two app service plans are warm and one is hot, value of warm gets assigned to mots
+        # Hence, if three app service plans are hot and one is invalid, value of hot gets assigned to mots
+        # Hence, if three app service plans are warm and one is cannot determine, value of warm gets assigned to mots
+        analysis_df['standby_priority'] = analysis_df.groupby(['mots_id'])['standby_rank']. \
+            rank(method="first", ascending=True)
+        standby_df = analysis_df.loc[analysis_df['standby_priority'] == 1][['mots_id', 'standby_mode']]
+        return standby_df
+
+    @raise_exception_globally
+    def derive_application_standby_info(self, df):
+        # Only compute Hot/Warm standby information for PROD subscriptions
+        df = df.loc[df['subscription_type'] == 'PROD']
+        # Create dataframe with dr regions
+        dr_df = df.loc[df.dr_flag == 1]
+        dr_df = dr_df.copy()
+        # Derive resource key by removing dr and region names from resource name
+        if not dr_df.empty:
+            dr_df['resource_key'] = dr_df.apply(self.format_dr_resource_name_column, axis=1)
+        else:
+            dr_df['resource_key'] = ""
+        # dr_df.to_csv("dr_df.csv")
+        """
+        dr_df['resource_key'] = dr_df['resource_name'].str.replace("-dr-", "").\
+                                                              replace(dr_df['location'], "")
+        """
+        # Create dataframe with non dr regions
+        non_dr_df = df.loc[df.dr_flag == 0]
+        non_dr_df = non_dr_df.copy()
+        # Derive resource key by removing prod, dev, nprd, test and region names from resource name
+        if not non_dr_df.empty:
+            non_dr_df['resource_key'] = non_dr_df.apply(self.format_nondr_resource_name_column, axis=1)
+        else:
+            non_dr_df['resource_key'] = ""
+        # non_dr_df.to_csv("non_dr_df.csv")
+        # Join non dr with dr df
+        join_df = non_dr_df.merge(dr_df,
+                                  on=["mots_id", "subscription_id", "resource_key"],
+                                  how="outer",
+                                  suffixes=['_non_dr', '_dr'])
+        """ Making below a part of common method
+
+        # if both dr and non dr app service plans are present
+        # worker size of dr is less than prod, then mark as warm standby
+        # if both dr and non dr app service plans are present
+        # worker size of dr is equal to prod, then mark as hot standby
+        # if both dr and non dr app service plans are present
+        # worker size of dr is greater than prod, then mark as invalid standby
+        # If either dr or non dr app service plan is present, mark as cannot be determined
+        conditions = [(~ join_df['resource_name_non_dr'].isna())
+                      &
+                      (~ join_df['resource_name_dr'].isna())
+                      &
+                      (join_df['cost_dr'] < join_df['cost_non_dr']),
+                      (~ join_df['resource_name_non_dr'].isna())
+                      &
+                      (~ join_df['resource_name_dr'].isna())
+                      &
+                      (join_df['cost_dr'] == join_df['cost_non_dr']),
+                      (~ join_df['resource_name_non_dr'].isna())
+                      &
+                      (~ join_df['resource_name_dr'].isna())
+                      &
+                      (join_df['cost_dr'] > join_df['cost_non_dr']),
+                      (join_df['resource_name_non_dr'].isna())
+                      |
+                      (join_df['resource_name_dr'].isna())
+                      ]
+        choices = ["warm", "hot", "invalid", "cannot determine"]
+        join_df['standby_mode'] = np.select(conditions, choices)
+        # Rank the app service plans within subscription
+        conditions = [join_df['standby_mode'] == "warm",
+                      join_df['standby_mode'] == "hot",
+                      join_df['standby_mode'] == "invalid",
+                      join_df['standby_mode'] == "cannot determine"
+                      ]
+        choices = [1, 2, 3, 4]
+        join_df['standby_rank'] = np.select(conditions, choices)
+        # Further rank the data so that the highest of all 4 is taken for every mots
+        # Hence, if two app service plans are warm and one is hot, value of warm gets assigned to mots
+        # Hence, if three app service plans are hot and one is invalid, value of hot gets assigned to mots
+        # Hence, if three app service plans are warm and one is cannot determine, value of warm gets assigned to mots
+        join_df['standby_priority'] = join_df.groupby(['mots_id'])['standby_rank']. \
+            rank(method="first", ascending=True)
+        mots_standby_df = join_df.loc[join_df['standby_priority'] == 1][['mots_id', 'standby_mode']]
+        """
+        mots_standby_df = self.compute_standby_info(join_df)
+        # Identify app service plans with invalid standby and create invalid_standby_df
+        invalid_standby_df = self.compute_invalid_standby_info(join_df)
+        # invalid_number_of_workers_df = self.compute_invalid_number_of_workers_info(join_df)
+        # Separate MOTS for which standby mode can be determined
+        # and MOTS for which standby mode cannot be determined
+        determined_mots_standby_df = mots_standby_df.loc[mots_standby_df['standby_mode'] != 'cannot determine']
+        non_determined_mots_standby_df = mots_standby_df.loc[mots_standby_df['standby_mode'] == 'cannot determine']
+        non_determined_mots_standby_list = non_determined_mots_standby_df['mots_id'].tolist()
+        non_determined_mots_standby_analysis_df = df.loc[df['mots_id'].isin(non_determined_mots_standby_list)]
+        reevaulated_mots_standby_df, \
+            reevaluated_invalid_standby_df = self.reevaulate_mots_standby_df(
+            non_determined_mots_standby_analysis_df)
+        reevaulated_mots_standby_list = reevaulated_mots_standby_df['mots_id'].tolist()
+        non_determined_mots_standby_df = non_determined_mots_standby_df.loc[~non_determined_mots_standby_df['mots_id'].
+        isin(reevaulated_mots_standby_list)]
+        # Combine with re-evaluated dataframes
+        mots_standby_df = pd.concat(
+            [determined_mots_standby_df, reevaulated_mots_standby_df, non_determined_mots_standby_df],
+            axis=0)
+        invalid_standby_df = pd.concat([invalid_standby_df, reevaluated_invalid_standby_df],
+                                       axis=0)
+        # invalid_number_of_workers_df = pd.concat(
+        #     [invalid_number_of_workers_df, reevaluated_invalid_number_of_workers_df],
+        #     axis=0)
+        return mots_standby_df, invalid_standby_df
+
+    def compute_dr_flag(self, final_df):
+        self.logger.info("Computing DR flag")
+        self.logger.info(f"Columns in returned fetch data after compute_dr_flag final df DataFrame: {final_df.columns.tolist()}")
+
+        conditions = [final_df['subscription_name'].str.contains("-PROD-"),
+                      final_df['subscription_name'].str.contains("-NPRD-")]
+        choices = ["PROD", "NPROD"]
+        final_df['subscription_type'] = np.select(conditions, choices, default=0)
+        analysis_df = final_df.groupby(['mots_id', 'subscription_type', 'location']). \
+            agg({'cpu_utilization': 'sum'}). \
+            reset_index()
+        # Assign rank of 1 to app service plan within a subscription having the highest utilization
+        analysis_df['dr_rank'] = analysis_df.groupby(['mots_id', 'subscription_type'])['cpu_utilization']. \
+            rank(method="first", ascending=False)
+
+        conditions = [analysis_df['dr_rank'] == 1]
+        choices = [0]
+        analysis_df['dr_flag_as_per_cpu_utilization'] = np.select(conditions, choices, default=1)
+        # Create a copy of main dataframe
+        analysis_2_df = final_df.copy()
+        self.logger.info(f"Columns in returned compute_dr_flag analysis_2_df DataFrame: {analysis_2_df.columns.tolist()}")
+        conditions = [analysis_2_df['resource_group'].str.contains("-dr-"),
+                      analysis_2_df['resource_group'].str.contains("-prod-")]
+        choices = [1, 0]
+        analysis_2_df['dr_flag_as_per_naming_convention'] = np.select(conditions, choices, default=-1)
+        # In case any one resource group does not follow prod or dr naming convention
+        # But at least one  within subscription does follow it, take that value
+        # Hence, take max of dr flag
+        analysis_2_df = analysis_2_df.groupby(['mots_id', 'subscription_type', 'location']). \
+            agg({'dr_flag_as_per_naming_convention': 'max'}). \
+            reset_index()
+        # Merge the final dataframe with aggregated dataframe to fetch the dr flag
+        final_df = final_df.merge(analysis_df[['mots_id',
+                                               'subscription_type',
+                                               'location',
+                                               'dr_flag_as_per_cpu_utilization']],
+                                  on=['mots_id', 'subscription_type', 'location'],
+                                  how="left")
+        # Merge the final dataframe with aggregated dataframe to fetch the dr flag
+        final_df = final_df.merge(analysis_2_df[['mots_id',
+                                                 'subscription_type',
+                                                 'location',
+                                                 'dr_flag_as_per_naming_convention']],
+                                  on=['mots_id', 'subscription_type', 'location'],
+                                  how="left")
+        # If resource group follows dr or prod naming convention, take that as dr flag
+        # else take dr_flag_as_per_cpu_utilization as dr_flag
+        conditions = [final_df['dr_flag_as_per_naming_convention'] != -1,
+                      final_df['dr_flag_as_per_naming_convention'] == -1
+                      ]
+        choices = [final_df['dr_flag_as_per_naming_convention'],
+                   final_df['dr_flag_as_per_cpu_utilization']
+                   ]
+        final_df['dr_flag'] = np.select(conditions, choices, default=0)
+
+        # Find for only prod subscriptions, if dr flag as per naming convention marks all
+        # the regions as prod, then use cpu utilization
+        dr_max_flag_df = final_df.loc[final_df['subscription_type'] == 'PROD'].groupby(['mots_id']).agg(
+            {'dr_flag': 'max'}).reset_index()
+        # Rename column to be used in the next step
+        dr_max_flag_df = dr_max_flag_df.rename(columns={'dr_flag': 'max_dr_flag'})
+        # Populate max dr flag for every mots id in final df
+        final_df = final_df.merge(dr_max_flag_df[['mots_id', 'max_dr_flag']],
+                                  on=['mots_id'],
+                                  how="inner")
+        # If max flag is 0 for a mots(prod subscriptions), use the dr flag as per cpu utilization
+        # If max flag is 0 and there are more than one region for a MOTS,
+        # This means app service plans in both primary and dr region have -prod- in their name
+        conditions = [(final_df['max_dr_flag'] == 0) &
+                      (final_df['subscription_type'] == 'PROD'),
+                      (final_df['max_dr_flag'] != 0) &
+                      (final_df['subscription_type'] == 'PROD')
+                      ]
+        choices = [final_df['dr_flag_as_per_cpu_utilization'], final_df['dr_flag']]
+        final_df['dr_flag'] = np.select(conditions, choices, default=final_df['dr_flag'])
+        return final_df
+
+    @raise_exception_globally
+    def generate_measures_based_on_dr_flag(self, final_df):
+        # If region has been identified as dr region but has higher utilization
+        # assign dr_high_cpu_utilization_flag to 1
+        conditions = [(final_df['dr_flag_as_per_cpu_utilization'] == 0) &
+                      (final_df['dr_flag'] == 1)]
+        choices = [1]
+        final_df['dr_high_cpu_utilization_flag'] = np.select(conditions, choices, default=0)
+        # Compute standby mode of application
+        # Compute invalid standby configuration in dr region
+        # Compute invalid number of worker nodes in dr region
+        mots_standby_df, invalid_standby_df = self.derive_application_standby_info(
+            final_df)
+        # mots_standby_df.to_csv("mots_standby_df.csv")
+        # Generate unique combinations of subscription id, location and dr flag
+        analysis_df = final_df[['mots_id',
+                                'subscription_type',
+                                'location',
+                                'dr_flag']].drop_duplicates()
+        # Aggregate number of workers and cpu utilization group by subscription and location
+        aggregated_df = final_df.groupby(['mots_id',
+                                          'subscription_type',
+                                          'location']). \
+            agg({
+                 'cpu_utilization': 'sum'
+                 }).reset_index()
+        # Take those subscription and locations that are dr regions
+        analysis_dr_df = analysis_df.loc[analysis_df['dr_flag'] == 1]
+        # Rename aggregated columns
+        aggregated_dr_df = aggregated_df.copy().rename(
+            columns={
+                     'cpu_utilization': 'cpu_utilization_dr',
+                     })
+        # Join with dr dataframe to get aggregated values for dr regions
+        aggregated_dr_df = aggregated_dr_df.merge(analysis_dr_df,
+                                                  on=['mots_id', 'subscription_type', 'location'],
+                                                  how="inner")
+        # Rename location column as a dr region column
+        aggregated_dr_df = aggregated_dr_df.rename(columns={'location': 'location_dr'})
+        # In case there are multiple dr regions, combine their values and aggregated measures
+        aggregated_dr_df = aggregated_dr_df.groupby(['mots_id', 'subscription_type']). \
+            agg({
+                 'cpu_utilization_dr': 'sum',
+                 'location_dr': lambda x: ", ".join(x)}). \
+            reset_index()
+        # Take those subscription and locations that are non dr regions
+        analysis_active_df = analysis_df.loc[analysis_df['dr_flag'] == 0]
+        # Rename aggregated columns
+        aggregated_active_df = aggregated_df.copy().rename(
+            columns={
+                     'cpu_utilization': 'cpu_utilization_non_dr'
+                     })
+        # Join with non dr dataframe to get aggregated values for dr regions
+        aggregated_active_df = aggregated_active_df.merge(analysis_active_df,
+                                                          on=['mots_id', 'subscription_type', 'location'],
+                                                          how="inner")
+        aggregated_active_df = aggregated_active_df.rename(columns={'location': 'location_non_dr'})
+        # In case there are multiple dr regions, combine their values and aggregated measures
+        aggregated_active_df = aggregated_active_df.groupby(['mots_id', 'subscription_type']). \
+            agg({
+                 'cpu_utilization_non_dr': 'sum',
+                 'location_non_dr': lambda x: ", ".join(x)}). \
+            reset_index()
+        # Combine final dataframe with aggregated dr data
+        final_df = final_df.merge(aggregated_dr_df[['mots_id',
+                                                    'subscription_type',
+                                                    'location_dr',
+
+                                                    'cpu_utilization_dr']],
+                                  on=["mots_id", "subscription_type"],
+                                  how="left")
+        # Combine final dataframe with aggregated active data
+        final_df = final_df.merge(aggregated_active_df[['mots_id',
+                                                        'subscription_type',
+                                                        'location_non_dr',
+
+                                                        'cpu_utilization_non_dr']],
+                                  on=["mots_id", "subscription_type"],
+                                  how="left")
+        # Count distinct number of regions per subscription
+        region_count_df = final_df.groupby(['mots_id', 'subscription_type'])['location'].nunique().reset_index()
+        region_count_df = region_count_df.rename(columns={'location': 'location_count'})
+        # Merge this count with main dataframe
+        final_df = final_df.merge(region_count_df,
+                                  on=["mots_id", "subscription_type"],
+                                  how="inner")
+        # region_count_df.to_csv("region_count_df.csv")
+        # Merge standby info for mots with main dataframe
+        # Same value gets copied to Non prod subscription as that data is not relevant for hot/warm standby rules
+        final_df = final_df.merge(mots_standby_df,
+                                  on=["mots_id"],
+                                  how="inner")
+        # In case standby mode cannot be determined but resource group contains prod,
+        # that means resource group within subscription does not contain dr but only prod
+        # Hence, missing dr flag is set as 1
+        conditions = [(final_df['standby_mode'] == "cannot determine") &
+                      (final_df['resource_group'].str.contains("-prod-"))]
+        choices = [1]
+        final_df['dr_missing_flag'] = np.select(conditions, choices, default=0)
+        # In case standby mode cannot be determined but resource group contains dr,
+        # that means resource group within subscription does not contain prod but only dr
+        # Hence, missing prod flag is set as 1
+        conditions = [(final_df['standby_mode'] == "cannot determine") &
+                      (final_df['resource_group'].str.contains("-dr-"))]
+        choices = [1]
+        final_df['prod_missing_flag'] = np.select(conditions, choices, default=0)
+        # Merge standby info for mots with main dataframe
+        final_df = final_df.merge(invalid_standby_df,
+                                  on=["mots_id",
+                                      "subscription_id",
+                                      "resource_name"],
+                                  how="left")
+        # Merge invalid workers for mots with main dataframe
+        # final_df = final_df.merge(invalid_number_of_workers_df,
+        #                           on=["mots_id",
+        #                               "subscription_id",
+        #                               "resource_name"],
+        #                           how="left")
+        # Mark records with non dr workers greater than dr workers by more than 30 percentage
+        # final_df['workers_delta_more_than_30_percentage'] = ((final_df['current_number_of_workers_non_dr'] -
+        #                                                       final_df['current_number_of_workers_dr']) /
+        #                                                      final_df['current_number_of_workers_non_dr']) > 0.3
+        # # Mark records with non dr workers greater than dr workers by more than 20 percentage
+        # final_df['workers_delta_more_than_20_percentage'] = ((final_df['current_number_of_workers_non_dr'] -
+        #                                                       final_df['current_number_of_workers_dr']) /
+        #                                                      final_df['current_number_of_workers_non_dr']) > 0.2
+        final_df['cpu_utilization_delta_more_than_30_percentage'] = ((final_df['cpu_utilization_non_dr'] -
+                                                                      final_df['cpu_utilization_dr']) /
+                                                                     final_df['cpu_utilization_non_dr']) > 0.3
+        # Change the datatype of boolean fields to int values
+        # final_df['workers_delta_more_than_30_percentage'] = final_df['workers_delta_more_than_30_percentage'].astype(
+        #     int)
+        # final_df['workers_delta_more_than_20_percentage'] = final_df['workers_delta_more_than_20_percentage'].astype(
+        #     int)
+        final_df['cpu_utilization_delta_more_than_30_percentage'] = final_df[
+            'cpu_utilization_delta_more_than_30_percentage'].astype(int)
+        # Join with rt code
+        final_df = final_df.merge(self.rt_values_df[['mots_id', 'rt_code']],
+                                  on=['mots_id'],
+                                  how="left")
+        return final_df
+
+    @raise_exception_globally
+    def compute_derived_rt_value(self, final_df):
+        # Keep the fields required to calculate RTI value of '0A', '1A' or '1B'.
+        analysis_0a_1a_1b_df = final_df[['mots_id',
+                                         'subscription_type',
+                                         'cpu_utilization_dr',
+                                         'cpu_utilization_non_dr',
+                                         'dr_exercise_time']].drop_duplicates()
+        # Apply the conditions to calculate RTI value of 0A, 1A or 1B.
+        conditions = [
+            (analysis_0a_1a_1b_df['cpu_utilization_dr'] >= 0.5 * analysis_0a_1a_1b_df['cpu_utilization_non_dr']) &
+            (analysis_0a_1a_1b_df['subscription_type'] == "PROD"),
+            (analysis_0a_1a_1b_df['cpu_utilization_dr'] < 0.05 * analysis_0a_1a_1b_df['cpu_utilization_non_dr']) &
+            (analysis_0a_1a_1b_df['subscription_type'] == "PROD") & (analysis_0a_1a_1b_df['dr_exercise_time'] <= 60),
+            (analysis_0a_1a_1b_df['cpu_utilization_dr'] < 0.05 * analysis_0a_1a_1b_df['cpu_utilization_non_dr']) &
+            (analysis_0a_1a_1b_df['subscription_type'] == "PROD") & (analysis_0a_1a_1b_df['dr_exercise_time'] > 60)
+        ]
+        choices = ['0A', '1A', '1B']
+        analysis_0a_1a_1b_df['derived_rti'] = np.select(conditions, choices, default=0)
+        # Keep only the records where the RTI value of '0A', '1A' or '1B' is calculated
+        analysis_0a_1a_1b_df = analysis_0a_1a_1b_df.loc[analysis_0a_1a_1b_df.derived_rti.isin(['0A', '1A', '1B'])]
+        # Keep only the required fields
+        analysis_0a_1a_1b_df = analysis_0a_1a_1b_df[['mots_id',
+                                                     'subscription_type',
+                                                     'derived_rti',
+                                                     'dr_exercise_time']]
+
+        analysis_0a_1a_1b_df.to_csv("analysis_0a_1a_1b_df.csv")
+        analysis_2a_2b_df = final_df[['mots_id',
+                                      'subscription_type',
+                                      'dr_flag',
+                                      'state_flag'
+                                      ]]
+        analysis_2a_2b_df = analysis_2a_2b_df.groupby(['mots_id',
+                                                       'subscription_type',
+                                                       'dr_flag']).agg({'state_flag': 'max'}).reset_index()
+        conditions = [(analysis_2a_2b_df['dr_flag'] == 1) &
+                      (analysis_2a_2b_df['state_flag'] == 0) &
+                      (analysis_2a_2b_df['subscription_type'] == "PROD")]
+        choices = ['2A/2B']
+        analysis_2a_2b_df['derived_rti'] = np.select(conditions, choices, default=0)
+        analysis_2a_2b_df = analysis_2a_2b_df.loc[analysis_2a_2b_df.derived_rti.isin(['2A/2B'])]
+        # Keep only the required fields
+        analysis_2a_2b_df = analysis_2a_2b_df[['mots_id',
+                                               'subscription_type',
+                                               'derived_rti']]
+        analysis_2a_2b_df.to_csv("analysis_2a_2b_df.csv")
+        analysis_3a_df = final_df[['mots_id',
+                                   'subscription_type',
+                                   'dr_flag'
+                                   ]]
+        analysis_3a_df = analysis_3a_df.loc[analysis_3a_df['subscription_type'] == "PROD"]
+        analysis_3a_mots_df = analysis_3a_df.groupby(['mots_id', 'subscription_type']). \
+            agg({'dr_flag': 'max'}).reset_index()
+        analysis_3a_df = analysis_3a_df[['mots_id',
+                                         'subscription_type']].drop_duplicates()
+        analysis_3a_df = analysis_3a_df.merge(analysis_3a_mots_df,
+                                              on=['mots_id', 'subscription_type'],
+                                              how="inner")
+        conditions = [(analysis_3a_df.dr_flag == 0) &
+                      (analysis_3a_df['subscription_type'] == "PROD")]
+        choices = ['3A']
+        analysis_3a_df['derived_rti'] = np.select(conditions, choices, default=0)
+        analysis_3a_df = analysis_3a_df.loc[analysis_3a_df.derived_rti.isin(['3A'])]
+        analysis_3a_df.to_csv("analysis_3a_df.csv")
+        analysis_df = pd.concat([analysis_0a_1a_1b_df,
+                                 analysis_2a_2b_df,
+                                 analysis_3a_df],
+                                axis=0)
+        derived_rti_df = analysis_df[['mots_id', 'derived_rti']].drop_duplicates()
+        # Find MOTS IDs for which derived rti cannot be determined
+        missing_derived_rti_df = final_df[['mots_id']].drop_duplicates() \
+            .merge(derived_rti_df,
+                   on=['mots_id'],
+                   how='left',
+                   indicator=True)
+        missing_derived_rti_df = missing_derived_rti_df.rename(columns={'_merge': 'merge_indicator'})
+        # Identify MOTS IDs which derived rti could not be determined
+        missing_derived_rti_df = missing_derived_rti_df.loc[missing_derived_rti_df['merge_indicator'] ==
+                                                            'left_only']
+        missing_derived_rti_df = missing_derived_rti_df.drop(columns=['merge_indicator'])
+        # Set derived rti to 0
+        missing_derived_rti_df.loc[:, 'derived_rti'] = '0'
+        # Concatenate missing rti with derived rt dataframe
+        if not missing_derived_rti_df.empty:
+            derived_rti_df = pd.concat([derived_rti_df, missing_derived_rti_df],
+                                       axis=0)
+        # Populate DR exercise time to calculate target rti
+        derived_rti_df = derived_rti_df.merge(final_df[['mots_id',
+                                                        'dr_exercise_time']].drop_duplicates(),
+                                              on=["mots_id"],
+                                              how="inner")
+        # Converting derived rti dataframe to Json
+        derived_rti_json = derived_rti_df.to_json(orient="records")
+        compute_target_value = ComputeTargetRTValueUtility(self.sf_conn, self.project_name)
+        derived_rti_df = compute_target_value.get_rt_parameters(derived_rti_json)
+        return derived_rti_df
+
+    @raise_exception_globally
+    def fetch_data(self):
+        df = dict()
+        # Executing query to get app service configuration from snowflake
+        self.logger.info("Fetch subscription configuration")
+        df['subscription_details'] = self.subscription_df
+
+        self.logger.info("Fetch Iaas DB config daily data")
+        df['sf_iaas_db_config_daily'] = pd.DataFrame(self.fetch_sf_iaas_db_config_daily_data())
+        self.logger.info(f"Columns in returned Config Daily Iaas DB DataFrame: {df['sf_iaas_db_config_daily'].columns.tolist()}")
+
+        self.logger.info("Fetch Iaas Db metrics data")
+        df['sf_iaas_db_metrics_daily'] = pd.DataFrame(self.fetch_sf_iaas_db_metrics_daily_data())
+        self.logger.info(f"Columns in returned Metrics Iaas DB DataFrame: {df['sf_iaas_db_metrics_daily'].columns.tolist()}")
+
+        self.resource_cost_config_df = self.sf_conn.query_to_df(
+            consts_cost.iaasdb_cost_configuration_query.format(os.environ['SF_TABLE_SCHEMA']), params=())
+        self.logger.info(f"Columns in returned Cost Config Iaas DB DataFrame: {self.resource_cost_config_df.columns.tolist()}")
+
+        self.logger.info("Join dataframes")
+        final_df = df['sf_iaas_db_config_daily']. \
+            merge(df['sf_iaas_db_metrics_daily'],
+                  on=["subscription_id", "resource_id"],
+                  how="left",
+            suffixes=("", "_m")). \
+            merge(self.subscription_df,
+                  on=["subscription_id"]). \
+            merge(self.resource_cost_config_df,
+                  on=["part_sku_size", "platform", "location"])
+
+        final_df = final_df.rename(columns={'cost': 'vm_sku_cost'})
+        if "mots_id" in final_df.columns:
+            final_df['mots_id'] = final_df['mots_id'].astype(str).str.strip()
+        else:
+            self.logger.error("mots_id column missing in final_df after subscription merge.")
+        # Invoke method that computes dr flag to mark regions as primary/dr
+        self.logger.info(f"Columns in returned fetch data final df DataFrame: {final_df.columns.tolist()}")
+        final_df = self.compute_dr_flag(final_df)
+        self.logger.info(f"Columns in returned fetch data after compute_dr_flag final df DataFrame: {final_df.columns.tolist()}")
+        # Compute measures based on dr flag
+        final_df = self.generate_measures_based_on_dr_flag(final_df)
+        if "mots_id" in final_df.columns:
+            final_df['mots_id'] = final_df['mots_id'].astype(str).str.strip()
+        else:
+            self.logger.error("mots_id column missing in final_df after subscription merge.")
+        self.logger.info(f"Columns in returned fetch data after generate_measures_based_on_dr_flag final df DataFrame: {final_df.columns.tolist()}")
+        print("Final DF after DR measures (first 5 rows):")
+        print(final_df.head())
+        # input("Press Enter to continue with DR exercise time query...")
+
+        final_df['mots_id'] = final_df['mots_id'].astype(str).str.strip()
+        mots_id_list = final_df['mots_id'].drop_duplicates().to_list()
+        mots_id_str = ",".join(mots_id_list)
+        print("MOTS IDs:", mots_id_str)
+        # Get DR exercise time
+        if mots_id_str.strip() == "":
+            self.logger.info("No MOTS IDs found. Creating empty DR exercise dataframe.")
+            dr_exercise_df = pd.DataFrame(columns=["mots_id", "dr_exercise_time"])
+        else:
+            query = drdb_consts.dr_exercise_time_mins_calculate.format(mots_id_str)
+            dr_exercise_df = self.sql_server_utility.query_to_df(query)
+        # Cast dr_exercise_df 'mots_id' to string before merge.
+        dr_exercise_df['mots_id'] = dr_exercise_df['mots_id'].astype(str).str.strip()
+        # Populate DR exercise time
+        final_df = final_df.merge(dr_exercise_df[['mots_id', 'dr_exercise_time']],
+                                  on=["mots_id"],
+                                  how="left")
+        derived_rti_df = self.compute_derived_rt_value(final_df)
+        final_df['mots_id'] = final_df['mots_id'].astype(str)
+        final_df = final_df.merge(derived_rti_df[["mots_id",
+                                                  "derived_rti",
+                                                  "business_criticality",
+                                                  "target_rt_code",
+                                                  "rti_status"
+                                                  ]],
+                                  on=["mots_id"],
+                                  how="left")
+        # Setting incorrect provisioning flag for cases when incorrect provisioning will lead to cost savings
+        conditions = [((final_df['target_rt_code'] == '3A') | (final_df['target_rt_code'] == '3B')) &
+                      (final_df['rti_status'] == 'over-provisioned') &
+                      (final_df['subscription_type'] == 'PROD') &
+                      (final_df['dr_flag'] == 1)]
+        choices = [1]
+        final_df['invalid_provisioning_flag'] = np.select(conditions, choices, 0)
+        # Identify expected number of workers
+        # If the target rt code is 2A/2B and the region is a DR region,
+        # then all App service plans within that region should have exactly 1 worker node
+        conditions = [(final_df["target_rt_code"] == '2A/2B') &
+                      (final_df["dr_flag"] == 1) &
+                      (final_df['subscription_type'] == "PROD"),
+                      (final_df["target_rt_code"] == '1B') &
+                      (final_df["dr_flag"] == 1) &
+                      (final_df['subscription_type'] == "PROD") &
+                      (final_df['standby_mode'] == "warm")
+                      ]
+        choices = [1, 1]
+        # final_df['expected_number_of_workers'] = np.select(conditions,
+        #                                                    choices,
+        #                                                    default=final_df['current_number_of_workers'])
+        """
+        conditions = [(final_df['cpu_utilization_dr'] >= 0.5*final_df['cpu_utilization_non_dr']) &
+                      (final_df['subscription_name'].str.contains("-PROD-")),
+                      (final_df['cpu_utilization_dr'] < 0.05 * final_df['cpu_utilization_non_dr']) &
+                      (final_df['subscription_name'].str.contains("-PROD-")),
+                      (final_df['dr_flag'] == 1) &
+                      (final_df['state_flag'] == 0) &
+                      (final_df['subscription_name'].str.contains("-PROD-")),
+                      (final_df['dr_missing_flag'] == 1) &
+                      (final_df['subscription_name'].str.contains("-PROD-")),
+                      (final_df['subscription_name'].str.contains("-NPRD-"))
+                      ]
+        choices = ['0A', '1B', '2A/2B', '3A', 0]
+        final_df['derived_rti'] = np.select(conditions, choices, default=0)
+        """
+        # Default null values
+        final_df = final_df.fillna(0)
+        return final_df
+
+
+def main():
+    from AzureUtils.azure_keyvault_utility import AzureKeyVaultUtility
+    from AzureUtils.azure_data_utility import AzureDataUtility
+    from DbUtils.snowflake_utility import SnowFlakeUtility
+    from datetime import datetime
+    import json
+    required_secrets = {'SF_PRIVATE_KEY': 'sf-private-key',
+                        'SF_PRIVATE_KEY_PASSPHRASE': 'sf-private-key-passphrase',
+                        'SF_USER': 'sf-user',
+                        'SF_ACCOUNT': 'sf-account',
+                        'SF_WAREHOUSE': 'sf-warehouse',
+                        'SF_DATABASE': 'sf-database',
+                        'SF_SCHEMA': 'sf-schema',
+                        'SF_TABLE_SCHEMA': 'sf-table-schema',
+                        'SF_AO_TABLE_SCHEMA': 'sf-ao-table-schema',
+                        'SQL_SERVER_HOST': 'sql-server-host',
+                        'SQL_SERVER_USER': 'sql-server-user',
+                        'SQL_SERVER_DATABASE': 'sql-server-database',
+                        'SQL_SERVER_PASSWORD': 'sql-server-password'
+                        }
+    project_home = os.path.dirname(os.path.dirname(__file__))
+    config_file_name = os.path.join(project_home, "askdrserver.conf")
+    azure_key_vault_utility = AzureKeyVaultUtility("Ask_DR_Project", config_file_name, required_secrets)
+    azure_key_vault_utility.load_keyvault_secrets_to_env()
+    config = dict(os.environ)
+    sf_con = SnowFlakeUtility(config)
+    azure_data_utility = AzureDataUtility("Ask_DR_Project", sf_con)
+    # derive subscription id from subscription name
+    subscription_name = """'ACC-NPRD-00000-PubCloud-POC07','ACC-NPRD-00000-PCEntArch_00','ACC-NPRD-00000-MODERNIZATIONPOC','ACC-NPRD-00000-PCEntArch_02','ACC-NPRD-00000-GESS-PoC','ACC-NPRD-00000-ATS-NEO-SANDBOX','ACC-NPRD-00000-IDCPOC','ACC-NPRD-00000-General-Purpose-Cloud-Lab','ACC-NPRD-00000-IsraelET-POC','ACC-NPRD-15-AIN Web Tool','ACC-PROD-15-AIN Web Tool','ACC-NPRD-00000-PCEntArch_01','ACC-NPRD-00000-FBO-POC','ACC-NPRD-00000-Flexware-CSP','ACC-NPRD-00000-CohenPOCPD','ACC-NPRD-00000-PCSAMCP','ACC-NPRD-00000-Solero POC','ACC-NPRD-33-CRIS ASBS','ACC-PROD-33-CRIS ASBS','ACC-NPRD-00000-Lynkit','ACC-NPRD-00000-Flexware2-CSP','ACC-NPRD-00000-TA-POC','ACC-NPRD-00000-PubCloud-DevOps','ACC-NPRD-00000-VGW','ACC-NPRD-0000-SDS-DEVOPS','ACC-NPRD-00000-ReservedInstance','ACC-NPRD-00000-RandolphPoC','ACC-NPRD-00000-CohenPoc','ACC-NPRD-00000-RINetwork','ACC-PROD-00000-Confluent','ACC-PROD-00000-ALM','ACC-NPRD-00000-MongoDBParent','ACC-NPRD-00000-PubCloud-POC07','ACC-NPRD-00000-PubCloud-POC02','ACC-NPRD-00000-Contrast2021','ACC-NPRD-00000-PubCloud-POC08','ACC-NPRD-00000-PubCloud-POC04','ACC-NPRD-00000-PubCloud-POC06','ACC-NPRD-00000-Skyline MCRE','ACC-NPRD-00000-EncryptTest-POC','ACC-NPRD-147-CSFT-PB','ACC-PROD-147-CSFT-PB','ACC-NPRD-214-EGIS','ACC-PROD-214-EGIS','ACC-NPRD-232-FAST','ACC-PROD-232-FAST','ACC-NPRD-265-IC-RED','ACC-PROD-265-IC-RED','ACC-NPRD-298-AP-PB','ACC-PROD-298-AP-PB','ACC-NPRD-407-NOW','ACC-PROD-407-NOW','ACC-NPRD-627-UPS-EMS','ACC-PROD-627-UPS-EMS','ACC-NPRD-628-UPSE-SWBT/PB','ACC-PROD-628-UPSE-SWBT/PB','ACC-NPRD-697-ULTS','ACC-PROD-697-ULTS','ACC-NPRD-1622-SMTCS','ACC-PROD-1622-SMTCS','ACC-NPRD-1655-ADCIS','ACC-PROD-1655-ADCIS','ACC-NPRD-2022-CENET','ACC-PROD-2022-CENET','ACC-NPRD-2342-CANS','ACC-PROD-2342-CANS','ACC-NPRD-2382-SCORE','ACC-PROD-2382-SCORE','ACC-NPRD-3958-RBS','ACC-PROD-3958-RBS','ACC-NPRD-4339-TDMS-LD','ACC-PROD-4339-TDMS-LD','ACC-NPRD-4667-EBTA','ACC-PROD-4667-EBTA','ACC-NPRD-4703-ESON','ACC-PROD-4703-ESON','ACC-NPRD-4756-CXMT','ACC-PROD-4756-CXMT','ACC-NPRD-4821-ALCS','ACC-PROD-4821-ALCS','ACC-NPRD-5374-APEX','ACC-PROD-5374-APEX','ACC-NPRD-5547-BPT','ACC-PROD-5547-BPT','ACC-NPRD-6119-TABdb','ACC-PROD-6119-TABdb','ACC-NPRD-6191-271 DSS PM1','ACC-PROD-6191-271 DSS PM1','ACC-NPRD-6193-T-BPT','ACC-PROD-6193-T-BPT','ACC-NPRD-6332-IDM','ACC-PROD-6332-IDM','ACC-NPRD-6457-SOLS','ACC-PROD-6457-SOLS','ACC-NPRD-7004-QAS','ACC-PROD-7004-QAS','ACC-NPRD-7005-ETM','ACC-PROD-7005-ETM','ACC-NPRD-7012-ARIS/EXACT Agent','ACC-PROD-7012-ARIS/EXACT Agent','ACC-NPRD-7024-PTD-BIT','ACC-PROD-7024-PTD-BIT','ACC-NPRD-7044-WEBADD/ESR','ACC-PROD-7044-WEBADD/ESR','ACC-NPRD-7202-CCAP','ACC-PROD-7202-CCAP','ACC-NPRD-7260-ICB-PS','ACC-PROD-7260-ICB-PS','ACC-NPRD-7310-MS SMS','ACC-NPRD-7455-PoolDB','ACC-PROD-7455-PoolDB','ACC-NPRD-7486-ILEC Online','ACC-PROD-7486-ILEC Online','ACC-NPRD-7559-eRepair','ACC-PROD-7559-eRepair','ACC-NPRD-7832-Green DB','ACC-PROD-7832-Green DB','ACC-NPRD-7856-FDW','ACC-PROD-7856-FDW','ACC-NPRD-7872-DSLOA','ACC-PROD-7872-DSLOA','ACC-NPRD-7921-BDS','ACC-PROD-7921-BDS','ACC-NPRD-7956-SRSTUDY','ACC-PROD-7956-SRSTUDY','ACC-NPRD-7983-EGS','ACC-PROD-7983-EGS','ACC-NPRD-7994-FRAMEMATE','ACC-PROD-7994-FRAMEMATE','ACC-NPRD-8095-DPSS WEB','ACC-PROD-8095-DPSS WEB','ACC-NPRD-8133-ATT TVI','ACC-PROD-8133-ATT TVI','ACC-NPRD-8182-ATT MACS','ACC-PROD-8182-ATT MACS','ACC-NPRD-8192-OBF','ACC-PROD-8192-OBF','ACC-NPRD-8214-PHB','ACC-PROD-8214-PHB','ACC-NPRD-8323-LNP-DS','ACC-PROD-8323-LNP-DS','ACC-NPRD-8687-DSI FILE','ACC-PROD-8687-DSI FILE','ACC-NPRD-8690-AD','ACC-PROD-8690-AADDS','ACC-PROD-8690-AD','ACC-PROD-8690-AzureAD','ACC-PROD-8690-AzureADTest','ACC-NPRD-8783-BPS','ACC-PROD-8783-BPS','ACC-NPRD-8793-NIB','ACC-PROD-8793-NIB','ACC-NPRD-8796-UC DID','ACC-PROD-8796-UC DID','ACC-NPRD-8817-TRACE','ACC-PROD-8817-TRACE','ACC-NPRD-8886-SOAP','ACC-PROD-8886-SOAP','ACC-NPRD-8929-CRE-Fire Safety','ACC-PROD-8929-CRE-Fire Safety','ACC-NPRD-8933-DASH','ACC-PROD-8933-DASH','ACC-NPRD-8936-OUS','ACC-PROD-8936-OUS','ACC-NPRD-8939-dbsoft','ACC-PROD-8939-dbsoft','ACC-NPRD-9028-NFAA','ACC-PROD-9028-NFAA','ACC-NPRD-9048-EDDF','ACC-PROD-9048-EDDF','ACC-NPRD-9049-LPW Web','ACC-PROD-9049-LPW Web','ACC-NPRD-9108-MIC-NT','ACC-PROD-9108-MIC-NT','ACC-NPRD-9119-Sales Tools','ACC-PROD-9119-Sales Tools','ACC-NPRD-9136-CCTP - ACT','ACC-PROD-9136-CCTP - ACT','ACC-NPRD-9173-SALESONE','ACC-PROD-9173-SALESONE','ACC-NPRD-9201-CHEETTA','ACC-PROD-9201-CHEETTA','ACC-NPRD-9209-iHub-Talos','ACC-PROD-9209-iHub-Talos','ACC-NPRD-9229-BORIS','ACC-PROD-9229-BORIS','ACC-NPRD-9311-MLD','ACC-PROD-9311-MLD','ACC-NPRD-9313-eTRACS','ACC-PROD-9313-eTRACS','ACC-NPRD-9331-enGaugeTools','ACC-PROD-9331-enGaugeTools','ACC-NPRD-9351-PCRCS','ACC-PROD-9351-PCRCS','ACC-NPRD-9367-ATT CCTP CTI FRAME','ACC-PROD-9367-ATT CCTP CTI FRAME','ACC-NPRD-9370-FALCON','ACC-PROD-9370-FALCON','ACC-NPRD-9387-CREME','ACC-PROD-9387-CREME','ACC-NPRD-9500-HRA','ACC-PROD-9500-HRA','ACC-NPRD-9502-Boomerang','ACC-PROD-9502-Boomerang','ACC-NPRD-9511-CODES','ACC-PROD-9511-CODES','ACC-NPRD-9549-Table Manager','ACC-PROD-9549-Table Manager','ACC-NPRD-9564-WITTDB','ACC-PROD-9564-WITTDB','ACC-NPRD-9566-MKTGIS','ACC-PROD-9566-MKTGIS','ACC-NPRD-9569-SWAT','ACC-PROD-9569-SWAT','ACC-NPRD-9593-BIS/BAM','ACC-PROD-9593-BIS/BAM','ACC-NPRD-9642-LASR RTU','ACC-PROD-9642-LASR RTU','ACC-NPRD-9650-EA Processing','ACC-PROD-9650-EA Processing','ACC-NPRD-9698-LaunchPad','ACC-PROD-9698-LaunchPad','ACC-NPRD-9714-SDC','ACC-PROD-9714-SDC','ACC-NPRD-9748-SBCCC','ACC-PROD-9748-SBCCC','ACC-NPRD-9799-ARCS','ACC-PROD-9799-ARCS','ACC-NPRD-9811-EIA','ACC-PROD-9811-EIA','ACC-NPRD-9840-CPMRR','ACC-PROD-9840-CPMRR','ACC-NPRD-9855-FIRSTWFM','ACC-PROD-9855-FIRSTWFM','ACC-NPRD-9868-VSSS','ACC-PROD-9868-VSSS','ACC-NPRD-9883-CCTP Scripting','ACC-PROD-9883-CCTP Scripting','ACC-NPRD-9934-RORDER','ACC-PROD-9934-RORDER','ACC-NPRD-9946-DSCAT','ACC-PROD-9946-DSCAT','ACC-NPRD-9986-CBSWEB','ACC-PROD-9986-CBSWEB','ACC-NPRD-9995-USOC Browser','ACC-PROD-9995-USOC Browser','ACC-NPRD-10013-QH HOG','ACC-PROD-10013-QH HOG','ACC-NPRD-10027-TTBR','ACC-PROD-10027-TTBR','ACC-NPRD-10055-EBMIS','ACC-PROD-10055-EBMIS','ACC-NPRD-10058-gotama','ACC-PROD-10058-gotama','ACC-NPRD-10089-CCS-Tuxedo','ACC-PROD-10089-CCS-Tuxedo','ACC-NPRD-10235-RMW WEB','ACC-PROD-10235-RMW WEB','ACC-NPRD-10250-VEGAS','ACC-PROD-10250-VEGAS','ACC-NPRD-10324-SBCSS','ACC-PROD-10324-SBCSS','ACC-NPRD-10343-DRS','ACC-PROD-10343-DRS','ACC-NPRD-10363-SHE IBM HTTP Web Server','ACC-PROD-10363-SHE IBM HTTP Web Server','ACC-NPRD-10417-G2','ACC-PROD-10417-G2','ACC-NPRD-10420-SBCCS ACCSYS','ACC-PROD-10420-SBCCS ACCSYS','ACC-NPRD-10435-iCBT','ACC-PROD-10435-iCBT','ACC-NPRD-10437-DOSEN','ACC-PROD-10437-DOSEN','ACC-NPRD-10463-RBU Referral','ACC-PROD-10463-RBU Referral','ACC-NPRD-10465-CRU','ACC-PROD-10465-CRU','ACC-NPRD-10472-IMIXC','ACC-PROD-10472-IMIXC','ACC-NPRD-10474-OVALS NSP','ACC-PROD-10474-OVALS NSP','ACC-NPRD-10514-AMNQ','ACC-PROD-10514-AMNQ','ACC-NPRD-10545-MDNCN','ACC-PROD-10545-MDNCN','ACC-NPRD-10575-BBTi','ACC-PROD-10575-BBTi','ACC-NPRD-10584-LCAT','ACC-PROD-10584-LCAT','ACC-NPRD-10593-ISAAC','ACC-PROD-10593-ISAAC','ACC-NPRD-10632-RRTool','ACC-PROD-10632-RRTool','ACC-NPRD-10634-APRS','ACC-PROD-10634-APRS','ACC-NPRD-10680-LS_NBSTF','ACC-PROD-10680-LS_NBSTF','ACC-NPRD-10727-ORMC','ACC-PROD-10727-ORMC','ACC-NPRD-10743-ERT','ACC-PROD-10743-ERT','ACC-NPRD-10771-AOTX','ACC-PROD-10771-AOTX','ACC-NPRD-12470-CTP','ACC-PROD-12470-CTP','ACC-NPRD-12471-CARE-LD','ACC-PROD-12471-CARE-LD','ACC-NPRD-12511-POPIS','ACC-PROD-12511-POPIS','ACC-NPRD-12513-PTA','ACC-PROD-12513-PTA','ACC-NPRD-12527-BCAPPS-CS','ACC-PROD-12527-BCAPPS-CS','ACC-NPRD-12531-MACD','ACC-PROD-12531-MACD','ACC-NPRD-12567-CAP-UC','ACC-PROD-12567-CAP-UC','ACC-NPRD-12571-CARE-ECS','ACC-PROD-12571-CARE-ECS','ACC-NPRD-12573-ACABS (AMPS)','ACC-PROD-12573-ACABS (AMPS)','ACC-NPRD-12582-FACTORS','ACC-PROD-12582-FACTORS','ACC-NPRD-12588-TAX PLATFORM','ACC-PROD-12588-TAX PLATFORM','ACC-NPRD-12601-PTS-ANS','ACC-PROD-12601-PTS-ANS','ACC-NPRD-12621-EAI','ACC-PROD-12621-EAI','ACC-NPRD-12639-COI','ACC-PROD-12639-COI','ACC-NPRD-12654-CBUS','ACC-PROD-12654-CBUS','ACC-NPRD-12665-IDB-TEXT','ACC-PROD-12665-IDB-TEXT','ACC-NPRD-12666-IDB-IIU','ACC-PROD-12666-IDB-IIU','ACC-NPRD-12709-GFP-CPE','ACC-NPRD-12722-SMART LNS','ACC-PROD-12722-SMART LNS','ACC-NPRD-12723-IRIS LNS','ACC-PROD-12723-IRIS LNS','ACC-NPRD-12764-MARS LNS','ACC-PROD-12764-MARS LNS','ACC-NPRD-12849-ALPLAN','ACC-PROD-12849-ALPLAN','ACC-NPRD-12890-E-CARE','ACC-PROD-12890-E-CARE','ACC-NPRD-12891-ECAM','ACC-PROD-12891-ECAM','ACC-NPRD-12897-BP3','ACC-PROD-12897-BP3','ACC-NPRD-12981-ITAMAC2000','ACC-PROD-12981-ITAMAC2000','ACC-NPRD-12983-IPRS2000','ACC-PROD-12983-IPRS2000','ACC-NPRD-13027-GALAXY ACS','ACC-PROD-13027-GALAXY ACS','ACC-NPRD-13039-CTMS','ACC-PROD-13039-CTMS','ACC-NPRD-13099-ELVIS','ACC-PROD-13099-ELVIS','ACC-NPRD-13100-TPEBPP','ACC-PROD-13100-TPEBPP','ACC-NPRD-13111-MIUS','ACC-PROD-13111-MIUS','ACC-NPRD-13153-INSP','ACC-PROD-13153-INSP','ACC-NPRD-13155-MPS ACS','ACC-PROD-13155-MPS ACS','ACC-NPRD-13200-NC3','ACC-PROD-13200-NC3','ACC-NPRD-13237-CMR','ACC-PROD-13237-CMR','ACC-NPRD-13278-ATCS OCP','ACC-PROD-13278-ATCS OCP','ACC-NPRD-13302-IMDB','ACC-PROD-13302-IMDB','ACC-NPRD-13374-LASERFICHE','ACC-PROD-13374-LASERFICHE','ACC-NPRD-13393-ATCS ASTS-ONLINE','ACC-PROD-13393-ATCS ASTS-ONLINE','ACC-NPRD-13417-OTIS','ACC-PROD-13417-OTIS','ACC-NPRD-13431-AYA','ACC-PROD-13431-AYA','ACC-NPRD-13432 -CORE','ACC-PROD-13432 -CORE','ACC-NPRD-13433-SA/SA-UP','ACC-PROD-13433-SA/SA-UP','ACC-NPRD-13475-ATCS CSMS','ACC-PROD-13475-ATCS CSMS','ACC-NPRD-13492-BILLING EDGE - GSBE - HIGH END','ACC-PROD-13492-BILLING EDGE - GSBE - HIGH END','ACC-NPRD-13496-PMOSS_CMT','ACC-PROD-13496-PMOSS_CMT','ACC-NPRD-13508-DTS-1','ACC-PROD-13508-DTS-1','ACC-NPRD-13509-OBATS','ACC-PROD-13509-OBATS','ACC-NPRD-13520-TPV ACS','ACC-PROD-13520-TPV ACS','ACC-NPRD-13530-CDIS','ACC-PROD-13530-CDIS','ACC-NPRD-13578-CCP2-SimpLogon','ACC-PROD-13578-CCP2-SimpLogon','ACC-NPRD-13598-SAFARI','ACC-PROD-13598-SAFARI','ACC-NPRD-13599-RMMS','ACC-PROD-13599-RMMS','ACC-NPRD-13602-APOC','ACC-PROD-13602-APOC','ACC-NPRD-13615-ADV8 - MSR-GTN','ACC-PROD-13615-ADV8 - MSR-GTN','ACC-NPRD-13625-BRASS (DSL)','ACC-PROD-13625-BRASS (DSL)','ACC-NPRD-13630-OMNIBILL (ACC)','ACC-PROD-13630-OMNIBILL (ACC)','ACC-NPRD-13647-RIPS-U','ACC-PROD-13647-RIPS-U','ACC-NPRD-13672-INSTAR','ACC-PROD-13672-INSTAR','ACC-NPRD-13673-PMOSS_CUR/WUR','ACC-PROD-13673-PMOSS_CUR/WUR','ACC-NPRD-13696-NRIS','ACC-PROD-13696-NRIS','ACC-NPRD-13713-BUNDLER','ACC-PROD-13713-BUNDLER','ACC-NPRD-13715-SDN-ONENET','ACC-PROD-13715-SDN-ONENET','ACC-NPRD-13722-STARGEMS','ACC-PROD-13722-STARGEMS','ACC-NPRD-13723-NPR Managed Services','ACC-PROD-13723-NPR Managed Services','ACC-NPRD-13784-FITCOM','ACC-PROD-13784-FITCOM','ACC-NPRD-13792-UB','ACC-PROD-13792-UB','ACC-NPRD-13826-LPF CALCULATOR','ACC-PROD-13826-LPF CALCULATOR','ACC-NPRD-13829-CMT-DATA','ACC-PROD-13829-CMT-DATA','ACC-NPRD-13830-BMP','ACC-PROD-13830-BMP','ACC-NPRD-13855-SPRIG','ACC-PROD-13855-SPRIG','ACC-NPRD-13899-NCMS','ACC-PROD-13899-NCMS','ACC-NPRD-13902-MAA-LD-HIERARCHIAL-MANAGER','ACC-PROD-13902-MAA-LD-HIERARCHIAL-MANAGER','ACC-NPRD-13921-SOE','ACC-PROD-13921-SOE','ACC-NPRD-13924-Webphone','ACC-PROD-13924-Webphone','ACC-NPRD-13969-GFMS','ACC-PROD-13969-GFMS','ACC-NPRD-14038-ESIGN','ACC-PROD-14038-ESIGN','ACC-NPRD-14086-DATABARN','ACC-PROD-14086-DATABARN','ACC-NPRD-14106-BGW','ACC-PROD-14106-BGW','ACC-NPRD-14148-EM ABS','ACC-PROD-14148-EM ABS','ACC-NPRD-14152-GAIM','ACC-PROD-14152-GAIM','ACC-NPRD-14155-ORS','ACC-PROD-14155-ORS','ACC-NPRD-14202-IGLOO','ACC-PROD-14202-IGLOO','ACC-NPRD-14219-RESULTS.COM','ACC-PROD-14219-RESULTS.COM','ACC-NPRD-14226-NGGN-I','ACC-PROD-14226-NGGN-I','ACC-NPRD-14233-DPS ACS','ACC-PROD-14233-DPS ACS','ACC-NPRD-14238-PCAWF','ACC-PROD-14238-PCAWF','ACC-NPRD-14262-CCI','ACC-PROD-14262-CCI','ACC-NPRD-14267-CARRIER WHOLESALE','ACC-PROD-14267-CARRIER WHOLESALE','ACC-NPRD-14269-ROME','ACC-PROD-14269-ROME','ACC-NPRD-14297-ELH','ACC-PROD-14297-ELH','ACC-NPRD-14329-CRECDMS','ACC-PROD-14329-CRECDMS','ACC-NPRD-14370-CSSWEB','ACC-PROD-14370-CSSWEB','ACC-NPRD-14372-PMOSS_GPR','ACC-PROD-14372-PMOSS_GPR','ACC-NPRD-14384-BBGW','ACC-PROD-14384-BBGW','ACC-NPRD-14404-LABRADOR','ACC-PROD-14404-LABRADOR','ACC-NPRD-14412-IRDW','ACC-PROD-14412-IRDW','ACC-NPRD-14463-SMNE','ACC-PROD-14463-SMNE','ACC-NPRD-14548-CVE','ACC-PROD-14548-CVE','ACC-NPRD-14560-TCSTIL','ACC-PROD-14560-TCSTIL','ACC-NPRD-14562-ATSMRT','ACC-PROD-14562-ATSMRT','ACC-NPRD-14570-CPECRM-ACS','ACC-PROD-14570-CPECRM-ACS','ACC-NPRD-14575-AMPD','ACC-PROD-14575-AMPD','ACC-NPRD-14599-GRSD','ACC-PROD-14599-GRSD','ACC-NPRD-14607-NACD','ACC-PROD-14607-NACD','ACC-NPRD-14648-AMCD','ACC-PROD-14648-AMCD','ACC-NPRD-14667-ACS-SG','ACC-PROD-14667-ACS-SG','ACC-NPRD-14800-IVS','ACC-PROD-14800-IVS','ACC-NPRD-14804-CEDW','ACC-PROD-14804-CEDW','ACC-NPRD-14808-CIM CPNI BIS','ACC-PROD-14808-CIM CPNI BIS','ACC-NPRD-14817-EAWeb','ACC-PROD-14817-EAWeb','ACC-NPRD-14821-STORM','ACC-PROD-14821-STORM','ACC-NPRD-14843-Legal Home Page','ACC-PROD-14843-Legal Home Page','ACC-NPRD-14866-ECOP','ACC-PROD-14866-ECOP','ACC-NPRD-14878-Focus Config','ACC-PROD-14878-Focus Config','ACC-NPRD-14890-ITL','ACC-PROD-14890-ITL','ACC-NPRD-14931-PEAT','ACC-PROD-14931-PEAT','ACC-NPRD-14936-NIDS','ACC-PROD-14936-NIDS','ACC-NPRD-14943-CRB','ACC-PROD-14943-CRB','ACC-NPRD-14971-eGBS','ACC-PROD-14971-eGBS','ACC-NPRD-15019-HVCP','ACC-PROD-15019-HVCP','ACC-NPRD-15022-Auto Letters','ACC-PROD-15022-Auto Letters','ACC-NPRD-15102-OMS-ONEVU','ACC-PROD-15102-OMS-ONEVU','ACC-NPRD-15138-ALEX','ACC-PROD-15138-ALEX','ACC-NPRD-15218-CT&V','ACC-PROD-15218-CT&V','ACC-NPRD-15227-MWOG','ACC-PROD-15227-MWOG','ACC-NPRD-15235-BIRT','ACC-PROD-15235-BIRT','ACC-NPRD-15240-CSOTS','ACC-PROD-15240-CSOTS','ACC-NPRD-15254-EASYSE','ACC-PROD-15254-EASYSE','ACC-NPRD-15280-SORT - Wholesale','ACC-PROD-15280-SORT - Wholesale','ACC-NPRD-15282-HITOPS','ACC-PROD-15282-HITOPS','ACC-NPRD-15329 -YWR','ACC-PROD-15329 -YWR','ACC-NPRD-15384-NAVCAS','ACC-PROD-15384-NAVCAS','ACC-NPRD-15397-NRS','ACC-PROD-15397-NRS','ACC-NPRD-15411-ODS','ACC-PROD-15411-ODS','ACC-NPRD-15429-PMAP/NG','ACC-PROD-15429-PMAP/NG','ACC-NPRD-15469-SI/SR','ACC-PROD-15469-SI/SR','ACC-NPRD-15483-SFMI','ACC-PROD-15483-SFMI','ACC-NPRD-15816-BCTool','ACC-PROD-15816-BCTool','ACC-NPRD-15848-BAN','ACC-PROD-15848-BAN','ACC-NPRD-15850-BDOT','ACC-PROD-15850-BDOT','ACC-NPRD-15860-CASH','ACC-PROD-15860-CASH','ACC-NPRD-15884-CCF-MAX','ACC-PROD-15884-CCF-MAX','ACC-NPRD-15908-ccConnect','ACC-PROD-15908-ccConnect','ACC-NPRD-15909-CC Tool','ACC-PROD-15909-CC Tool','ACC-NPRD-15945-Email-ODS','ACC-PROD-15945-Email-ODS','ACC-NPRD-15977-ImEFLEX','ACC-PROD-15977-ImEFLEX','ACC-NPRD-15985-UCM UNE319','ACC-PROD-15985-UCM UNE319','ACC-NPRD-16001-MAILBOT','ACC-PROD-16001-MAILBOT','ACC-NPRD-16115-TAX/TAR','ACC-PROD-16115-TAX/TAR','ACC-NPRD-16138-WREAP','ACC-PROD-16138-WREAP','ACC-NPRD-16153-ArcGIS Server','ACC-PROD-16153-ArcGIS Server','ACC-NPRD-16164-BCS','ACC-PROD-16164-BCS','ACC-NPRD-16172-BERT','ACC-PROD-16172-BERT','ACC-NPRD-16187-INSIGHT:BCTS','ACC-PROD-16187-INSIGHT:BCTS','ACC-NPRD-16188-BBNMS_LS','ACC-PROD-16188-BBNMS_LS','ACC-NPRD-16211-Core Services','ACC-PROD-16211-Core Services','ACC-NPRD-16212-CDCOG','ACC-PROD-16212-CDCOG','ACC-NPRD-16237-DAD - SE','ACC-PROD-16237-DAD - SE','ACC-NPRD-16251-EJF','ACC-PROD-16251-EJF','ACC-PROD-16262-eFOSS','ACC-NPRD-16310-LBE','ACC-PROD-16310-LBE','ACC-NPRD-16319-CCF-SBS','ACC-PROD-16319-CCF-SBS','ACC-NPRD-16325-BCOS','ACC-PROD-16325-BCOS','ACC-NPRD-16355-AAN','ACC-PROD-16355-AAN','ACC-NPRD-16370-CMRS','ACC-PROD-16370-CMRS','ACC-NPRD-16403-VDD','ACC-PROD-16403-VDD','ACC-NPRD-16407-FDB-STLMT','ACC-PROD-16407-FDB-STLMT','ACC-NPRD-16468-NTPT Scorecard','ACC-PROD-16468-NTPT Scorecard','ACC-NPRD-16548-FBIS','ACC-PROD-16548-FBIS','ACC-NPRD-16625-EPALS','ACC-PROD-16625-EPALS','ACC-NPRD-16627-GCAS Web','ACC-PROD-16627-GCAS Web','ACC-NPRD-16642-BCPR','ACC-PROD-16642-BCPR','ACC-NPRD-16643-POSSE','ACC-PROD-16643-POSSE','ACC-NPRD-16644-BAMS','ACC-PROD-16644-BAMS','ACC-NPRD-16652-ACATS','ACC-PROD-16652-ACATS','ACC-NPRD-16663-Clairvoyant-Vacation Scheduler','ACC-PROD-16663-Clairvoyant-Vacation Scheduler','ACC-NPRD-16697-MPCB','ACC-PROD-16697-MPCB','ACC-NPRD-16741-Security App','ACC-PROD-16741-Security App','ACC-NPRD-16784-Helios','ACC-PROD-16784-Helios','ACC-NPRD-16787-ICeBeRG','ACC-PROD-16787-ICeBeRG','ACC-NPRD-16797-MFTS','ACC-PROD-16797-MFTS','ACC-NPRD-16838-LPA','ACC-PROD-16838-LPA','ACC-NPRD-16887-ESCAPE Reports Server','ACC-PROD-16887-ESCAPE Reports Server','ACC-NPRD-16998-ACT','ACC-PROD-16998-ACT','ACC-NPRD-17007-QuickQuote SBS','ACC-PROD-17007-QuickQuote SBS','ACC-NPRD-17031-vTIL','ACC-PROD-17031-vTIL','ACC-NPRD-17046-BMP-Transaction','ACC-PROD-17046-BMP-Transaction','ACC-NPRD-17047-BMP-Reports','ACC-PROD-17047-BMP-Reports','ACC-NPRD-17074-ADEPT-ITO','ACC-PROD-17074-ADEPT-ITO','ACC-NPRD-17078-SRTS','ACC-PROD-17078-SRTS','ACC-NPRD-17137-PMOSS_eTAS','ACC-PROD-17137-PMOSS_eTAS','ACC-NPRD-17191-BBCATS','ACC-PROD-17191-BBCATS','ACC-NPRD-17205-PMOSS_PWS','ACC-PROD-17205-PMOSS_PWS','ACC-NPRD-17208-VIEW AND ANALYZE INVENTORY','ACC-PROD-17208-VIEW AND ANALYZE INVENTORY','ACC-NPRD-17234-EFORC','ACC-PROD-17234-EFORC','ACC-NPRD-17254-SRS-PAR SRS, PAR','ACC-PROD-17254-SRS-PAR SRS, PAR','ACC-NPRD-17356-TDS External Gateway','ACC-PROD-17356-TDS External Gateway','ACC-NPRD-17425-CSO Website','ACC-PROD-17425-CSO Website','ACC-NPRD-17443-GTAC','ACC-NPRD-17447-ITO-HPPPM','ACC-PROD-17447-ITO-HPPPM','ACC-NPRD-17455-CRFT','ACC-PROD-17455-CRFT','ACC-NPRD-17483-ETL OPS','ACC-PROD-17483-ETL OPS','ACC-NPRD-17574 -GBBSO - WebView','ACC-PROD-17574 -GBBSO - WebView','ACC-NPRD-17582-FSDA','ACC-PROD-17582-FSDA','ACC-NPRD-17589-TelAlert TelAlert Enterprise, TE','ACC-PROD-17589-TelAlert TelAlert Enterprise, TE','ACC-NPRD-17599-BEST','ACC-PROD-17599-BEST','ACC-NPRD-17614-NuT','ACC-PROD-17614-NuT','ACC-NPRD-17630-TPA','ACC-PROD-17630-TPA','ACC-NPRD-17649-GLUE','ACC-PROD-17649-GLUE','ACC-NPRD-17679-COU','ACC-PROD-17679-COU','ACC-NPRD-17685-GRS','ACC-PROD-17685-GRS','ACC-NPRD-17690-CSIPARENT','ACC-PROD-17690-CSIPARENT','ACC-NPRD-17714-RMS - C','ACC-PROD-17714-RMS - C','ACC-NPRD-17733-PDTS','ACC-PROD-17733-PDTS','ACC-NPRD-17734-TWS Maestro','ACC-PROD-17734-TWS Maestro','ACC-NPRD-17744-DLC','ACC-PROD-17744-DLC','ACC-NPRD-17765-CPC','ACC-PROD-17765-CPC','ACC-NPRD-17784-GEARS','ACC-PROD-17784-GEARS','ACC-NPRD-17805-DWS','ACC-PROD-17805-DWS','ACC-NPRD-17873-MDE 4.0 MDE, Mass Data Entry','ACC-PROD-17873-MDE 4.0 MDE, Mass Data Entry','ACC-NPRD-17876-MEDD','ACC-PROD-17876-MEDD','ACC-NPRD-17891-IPPT','ACC-PROD-17891-IPPT','ACC-NPRD-17903-EAVS','ACC-PROD-17903-EAVS','ACC-NPRD-17904-NIT','ACC-PROD-17904-NIT','ACC-NPRD-17905-tSurvey','ACC-PROD-17905-tSurvey','ACC-NPRD-17914-SCCM','ACC-PROD-17914-SCCM','ACC-NPRD-17946-ED-RECON','ACC-PROD-17946-ED-RECON','ACC-NPRD-17959-ANCS','ACC-PROD-17959-ANCS','ACC-NPRD-17962-CP','ACC-PROD-17962-CP','ACC-NPRD-17970-Nexus - Attendance','ACC-PROD-17970-Nexus - Attendance','ACC-NPRD-17977-Digital Signage','ACC-PROD-17977-Digital Signage','ACC-NPRD-17981-GIZMO','ACC-PROD-17981-GIZMO','ACC-NPRD-18006-CS2k-Reporting','ACC-PROD-18006-CS2k-Reporting','ACC-NPRD-18187-TORCH','ACC-PROD-18187-TORCH','ACC-NPRD-18199-tport','ACC-PROD-18199-tport','ACC-NPRD-18200-CCWEB','ACC-PROD-18200-CCWEB','ACC-NPRD-18233-MTI GIS','ACC-PROD-18233-MTI GIS','ACC-NPRD-18273-Care & TLG Adj/Accuracy Analytical Tool','ACC-PROD-18273-Care & TLG Adj/Accuracy Analytical Tool','ACC-NPRD-18274-DITREX','ACC-PROD-18274-DITREX','ACC-NPRD-18276-ICORE','ACC-PROD-18276-ICORE','ACC-NPRD-18280-WEDAT','ACC-PROD-18280-WEDAT','ACC-NPRD-18292-Circle','ACC-PROD-18292-Circle','ACC-NPRD-18296-HZNREP','ACC-PROD-18296-HZNREP','ACC-NPRD-18311-SRWA','ACC-PROD-18311-SRWA','ACC-NPRD-18341-SLM','ACC-PROD-18341-SLM','ACC-NPRD-18345-IPDB','ACC-PROD-18345-IPDB','ACC-NPRD-18376-CPEE','ACC-PROD-18376-CPEE','ACC-NPRD-18388-ICR','ACC-PROD-18388-ICR','ACC-NPRD-18436-PEARS','ACC-PROD-18436-PEARS','ACC-NPRD-18459-SAM SolicitAddrMgr','ACC-PROD-18459-SAM SolicitAddrMgr','ACC-NPRD-18467-PDRA','ACC-PROD-18467-PDRA','ACC-NPRD-18505-ICTRT','ACC-PROD-18505-ICTRT','ACC-NPRD-18536-CPEdu','ACC-PROD-18536-CPEdu','ACC-NPRD-18559-HPP','ACC-PROD-18559-HPP','ACC-NPRD-18562-AES','ACC-PROD-18562-AES','ACC-NPRD-18578-NPE-VIPS','ACC-PROD-18578-NPE-VIPS','ACC-NPRD-18589-ABA','ACC-PROD-18589-ABA','ACC-NPRD-18590-ACREP','ACC-PROD-18590-ACREP','ACC-NPRD-18653-UBM','ACC-PROD-18653-UBM','ACC-NPRD-18662-MRG','ACC-PROD-18662-MRG','ACC-NPRD-18675-GSA Whiteboard','ACC-PROD-18675-GSA Whiteboard','ACC-NPRD-18692-itWorkOrders','ACC-PROD-18692-itWorkOrders','ACC-NPRD-18714-myprocurement','ACC-PROD-18714-myprocurement','ACC-NPRD-18722-uDAS','ACC-PROD-18722-uDAS','ACC-NPRD-18781-ABPT','ACC-PROD-18781-ABPT','ACC-NPRD-18800-Sales Dashboard','ACC-PROD-18800-Sales Dashboard','ACC-NPRD-18818-CRMOP-ATTIS','ACC-PROD-18818-CRMOP-ATTIS','ACC-NPRD-18824 -APB','ACC-PROD-18824 -APB','ACC-NPRD-18826-ATC','ACC-PROD-18826-ATC','ACC-NPRD-18833-UNAD','ACC-PROD-18833-UNAD','ACC-NPRD-18871-PCNEC','ACC-PROD-18871-PCNEC','ACC-PROD-18876-IPTV','ACC-NPRD-18906-EDS','ACC-PROD-18906-EDS','ACC-NPRD-18911-e-template','ACC-PROD-18911-e-template','ACC-NPRD-18935-FD Troll','ACC-PROD-18935-FD Troll','ACC-NPRD-19030-OWP','ACC-PROD-19030-OWP','ACC-NPRD-19031-IAMS','ACC-PROD-19031-IAMS','ACC-NPRD-19041-EMS - C','ACC-PROD-19041-EMS - C','ACC-NPRD-19047-UPSTART','ACC-PROD-19047-UPSTART','ACC-NPRD-19048-R3:D2D','ACC-PROD-19048-R3:D2D','ACC-NPRD-19077-LSDRRT','ACC-PROD-19077-LSDRRT','ACC-NPRD-19103-GS','ACC-PROD-19103-GS','ACC-NPRD-19105-AVT','ACC-PROD-19105-AVT','ACC-PROD-19113-FINAUTO','ACC-NPRD-19124-UPFRONT','ACC-PROD-19124-UPFRONT','ACC-NPRD-19160-ITSDT','ACC-PROD-19160-ITSDT','ACC-NPRD-19218-Applause','ACC-PROD-19218-Applause','ACC-NPRD-19340-TDAP','ACC-PROD-19340-TDAP','ACC-NPRD-19375-OVALS_GIS','ACC-PROD-19375-OVALS_GIS','ACC-NPRD-19377-AutoSRM','ACC-PROD-19377-AutoSRM','ACC-NPRD-19399-eRD 2G','ACC-PROD-19399-eRD 2G','ACC-NPRD-19409-AOSTE','ACC-PROD-19409-AOSTE','ACC-NPRD-19432-WOCDT','ACC-PROD-19432-WOCDT','ACC-NPRD-19439-FIRST-ASSET','ACC-PROD-19439-FIRST-ASSET','ACC-NPRD-19440-DRDB','ACC-PROD-19440-DRDB','ACC-NPRD-19514-SNAP-NIS','ACC-PROD-19514-SNAP-NIS','ACC-PROD-19532-DEFAULT PID','ACC-NPRD-19534-PMATT','ACC-PROD-19534-PMATT','ACC-NPRD-19574-CC Tools','ACC-PROD-19574-CC Tools','ACC-NPRD-19578-SOE WAT','ACC-PROD-19578-SOE WAT','ACC-NPRD-19592-Jenkins','ACC-PROD-19592-Jenkins','ACC-NPRD-19695-RUBIX','ACC-PROD-19695-RUBIX','ACC-PROD-19704-CCAX','ACC-NPRD-19722-ONE Tool','ACC-PROD-19722-ONE Tool','ACC-NPRD-19726-RAASL','ACC-PROD-19726-RAASL','ACC-NPRD-19738-National RAN Support','ACC-PROD-19738-National RAN Support','ACC-NPRD-19740-CloudPortal','ACC-PROD-19740-CloudPortal','ACC-NPRD-19749-CODB','ACC-PROD-19749-CODB','ACC-NPRD-19761-FIRST-RT','ACC-PROD-19761-FIRST-RT','ACC-NPRD-19854-DRU','ACC-PROD-19854-DRU','ACC-NPRD-19856-RTM-HDN','ACC-PROD-19856-RTM-HDN','ACC-NPRD-19857-USH','ACC-PROD-19857-USH','ACC-NPRD-19862-COMPASS 2010','ACC-PROD-19862-COMPASS 2010','ACC-NPRD-19867-CAP','ACC-PROD-19867-CAP','ACC-NPRD-19868-PGDB','ACC-PROD-19868-PGDB','ACC-NPRD-19869-AFTSWM','ACC-PROD-19869-AFTSWM','ACC-NPRD-19879-iMASP-eSSD','ACC-PROD-19879-iMASP-eSSD','ACC-NPRD-19890-M WPM','ACC-PROD-19890-M WPM','ACC-NPRD-19895-ADS','ACC-PROD-19895-ADS','ACC-NPRD-19907-eBIG','ACC-PROD-19907-eBIG','ACC-NPRD-19909-CCPS','ACC-PROD-19909-CCPS','ACC-NPRD-19920-CPNI DM','ACC-PROD-19920-CPNI DM','ACC-PROD-19932-DDP-NPRD-combined','ACC-NPRD-19938-ASKS','ACC-PROD-19938-ASKS','ACC-NPRD-19958-Stargate','ACC-PROD-19958-Stargate','ACC-NPRD-19989 -PAPC','ACC-PROD-19989-PAPC','ACC-NPRD-19992-R3:eMQDS','ACC-PROD-19992-R3:eMQDS','ACC-NPRD-19994-pltdse','ACC-PROD-19994-pltdse','ACC-NPRD-19996-RTTP','ACC-PROD-19996-RTTP','ACC-NPRD-20011-DSF Tools','ACC-PROD-20011-DSF Tools','ACC-NPRD-20043-webapps','ACC-PROD-20043-webapps','ACC-NPRD-20046-BOOST','ACC-PROD-20046-BOOST','ACC-NPRD-20062-HVD','ACC-PROD-20062-HVD','ACC-NPRD-20064-LSC-RT','ACC-PROD-20064-LSC-RT','ACC-NPRD-20069-WholesaleCMA','ACC-PROD-20069-WholesaleCMA','ACC-NPRD-20073-WFA Reports Website','ACC-PROD-20073-WFA Reports Website','ACC-PROD-20084-FCCSU','ACC-NPRD-20093-SSBCWS','ACC-PROD-20093-SSBCWS','ACC-NPRD-20096-HPPC-ETQC','ACC-PROD-20096-HPPC-ETQC','ACC-NPRD-20110-SvcAmb','ACC-PROD-20110-SvcAmb','ACC-NPRD-20114-LS-ETM','ACC-PROD-20114-LS-ETM','ACC-PROD-20118-OmniView','ACC-NPRD-20133-SFL_DB','ACC-PROD-20133-SFL_DB','ACC-NPRD-20163-FPA','ACC-PROD-20163-FPA','ACC-NPRD-20199-SACCE Plus','ACC-PROD-20199-SACCE Plus','ACC-NPRD-20252-TaxRD','ACC-PROD-20252-TaxRD','ACC-NPRD-20277-PSTA','ACC-PROD-20277-PSTA','ACC-NPRD-20289-RANAnalysis','ACC-PROD-20289-RANAnalysis','ACC-NPRD-20299-FIRST PT GUI','ACC-PROD-20299-FIRST PT GUI','ACC-NPRD-20310-Amp-SE - Speakeasy','ACC-PROD-20310-Amp-SE - Speakeasy','ACC-NPRD-20316-MDP','ACC-PROD-20316-MDP','ACC-NPRD-20353-SORDS','ACC-PROD-20353-SORDS','ACC-NPRD-20354-LDBR','ACC-PROD-20354-LDBR','ACC-NPRD-20359-ALM','ACC-PROD-20359-ALM','ACC-NPRD-20392-MOG-DSLSE','ACC-PROD-20392-MOG-DSLSE','ACC-NPRD-20397-Retail Commander','ACC-PROD-20397-Retail Commander','ACC-NPRD-20413-LARIAT','ACC-PROD-20413-LARIAT','ACC-NPRD-20415-DRT','ACC-PROD-20415-DRT','ACC-NPRD-20416-AT&T-MicroStrategy','ACC-PROD-20416-AT&T-MicroStrategy','ACC-NPRD-20417-ASAC','ACC-PROD-20417-ASAC','ACC-NPRD-20650-Inventory Accounting Data Repository','ACC-PROD-20650-Inventory Accounting Data Repository','ACC-NPRD-20651-COMET','ACC-PROD-20651-COMET','ACC-NPRD-20654-CDT CHD TOOLKIT','ACC-PROD-20654-CDT CHD TOOLKIT','ACC-NPRD-20659-BTTW','ACC-PROD-20659-BTTW','ACC-NPRD-20665-eCAP BO','ACC-PROD-20665-eCAP BO','ACC-NPRD-20683-WOMBAT','ACC-PROD-20683-WOMBAT','ACC-NPRD-20704-DRPT','ACC-PROD-20704-DRPT','ACC-NPRD-20709-IP Tracker','ACC-PROD-20709-IP Tracker','ACC-NPRD-20737-BIPS','ACC-PROD-20737-BIPS','ACC-NPRD-20764-R3:Auto','ACC-PROD-20764-R3:Auto','ACC-NPRD-20782-DDAM SCCM','ACC-PROD-20782-Retail SCCM','ACC-NPRD-20789-DCRT','ACC-PROD-20789-DCRT','ACC-NPRD-20812-A-mon','ACC-PROD-20812-A-mon','ACC-NPRD-20815-CMSPort','ACC-PROD-20815-CMSPort','ACC-NPRD-20822-DTPP','ACC-PROD-20822-DTPP','ACC-NPRD-20826-MDB','ACC-PROD-20826-MDB','ACC-NPRD-20834-iSTARS Archive','ACC-PROD-20834-iSTARS Archive','ACC-NPRD-20898-EPA','ACC-PROD-20898-EPA','ACC-NPRD-20901-APEXAUTH','ACC-PROD-20901-APEXAUTH','ACC-NPRD-20902-CDTDPP','ACC-PROD-20902-CDTDPP','ACC-NPRD-20914-ITO Decomm','ACC-PROD-20914-ITO Decomm','ACC-NPRD-20922-NuTVoIP','ACC-PROD-20922-NuTVoIP','ACC-NPRD-20976-BKSunrise','ACC-PROD-20976-BKSunrise','ACC-NPRD-20980-TVAM','ACC-PROD-20980-TVAM','ACC-NPRD-20993-CCDB','ACC-PROD-20993-CCDB','ACC-NPRD-21023-ITRAC','ACC-PROD-21023-ITRAC','ACC-NPRD-21058-CSaM','ACC-PROD-21058-CSaM','ACC-NPRD-21059-NET_AUDIT','ACC-PROD-21059-NET_AUDIT','ACC-NPRD-21068-CCDR','ACC-PROD-21068-CCDR','ACC-NPRD-21084-ACM-C','ACC-PROD-21084-ACM-C','ACC-PROD-21104-BP Spotlight','ACC-NPRD-21110-MPMOD','ACC-PROD-21110-MPMOD','ACC-NPRD-21131-RAF','ACC-PROD-21131-RAF','ACC-NPRD-21132-PCE','ACC-PROD-21132-PCE','ACC-NPRD-21156-ADRM','ACC-PROD-21156-ADRM','ACC-NPRD-21205-Ariesogeo','ACC-PROD-21205-AriesoGEO','ACC-NPRD-21278-SIDTEL','ACC-PROD-21278-SIDTEL','ACC-NPRD-21282-SOA Cloud','ACC-PROD-21282-SOA Cloud','ACC-NPRD-21286-NetBrain','ACC-NPRD-21382-LTA5ESS','ACC-PROD-21382-LTA5ESS','ACC-NPRD-21390-CTRPT','ACC-PROD-21390-CTRPT','ACC-NPRD-21394-STaRT','ACC-PROD-21394-STaRT','ACC-NPRD-21572-GRP-CDI-Apps','ACC-PROD-21572-GRP-CDI-Apps','ACC-NPRD-21574-RANWEB','ACC-PROD-21574-RANWEB','ACC-NPRD-21587-ATS-SP','ACC-PROD-21587-ATS-SP','ACC-PROD-21607-AERO','ACC-NPRD-21612-ERAN','ACC-PROD-21612-ERAN','ACC-NPRD-21636-Mtrack','ACC-PROD-21636-Mtrack','ACC-NPRD-21644-LSMDB','ACC-PROD-21644-LSMDB','ACC-NPRD-21661-OpsTools','ACC-PROD-21661-OpsTools','ACC-NPRD-21677-NetOpts','ACC-PROD-21677-NetOpts','ACC-NPRD-21692-SonarQube','ACC-PROD-21692-SonarQube','ACC-NPRD-21695-SCFO','ACC-PROD-21695-SCFO','ACC-NPRD-21731-RMAP','ACC-PROD-21731-RMAP','ACC-NPRD-21737-AOTS-NEISA','ACC-PROD-21737-AOTS-NEISA','ACC-NPRD-21741-Toll-Free Mass Prov','ACC-PROD-21741-Toll-Free Mass Prov','ACC-NPRD-21752-TSnR','ACC-PROD-21752-TSnR','ACC-NPRD-21770-defacto','ACC-PROD-21770-defacto','ACC-NPRD-21771-REM-CRE-TRIRIGA','ACC-PROD-21771-REM-CRE-TRIRIGA','ACC-NPRD-21776-ABS PMPS','ACC-PROD-21776-ABS PMPS','ACC-NPRD-21802-Darkstar','ACC-PROD-21802-Darkstar','ACC-NPRD-21806-MATS','ACC-PROD-21806-MATS','ACC-NPRD-21845-Action Audit Control','ACC-PROD-21845-Action Audit Control','ACC-NPRD-21941-Q-RAS','ACC-PROD-21941-Q-RAS','ACC-NPRD-21948-T.Data','ACC-PROD-21948-T.Data','ACC-NPRD-21952-CIENA-PLANNING-TOOL','ACC-PROD-21952-CIENA-PLANNING-TOOL','ACC-NPRD-21977-NMIC','ACC-PROD-21977-NMIC','ACC-NPRD-21978-LASA','ACC-PROD-21978-LASA','ACC-NPRD-21986-Platinum','ACC-PROD-21986-Platinum','ACC-PROD-21998-Apptio','ACC-NPRD-22013-WMT ENT','ACC-PROD-22013-WMT ENT','ACC-PROD-22024-BNS-RT','ACC-NPRD-22028-VTAM','ACC-PROD-22028-VTAM','ACC-NPRD-22041-GEOLink_iCeCaP','ACC-PROD-22041-GEOLink_iCeCaP','ACC-NPRD-22102-SLaunch','ACC-PROD-22102-SLaunch','ACC-NPRD-22145-Depot OPS','ACC-PROD-22145-Depot OPS','ACC-NPRD-22166-GBSOMS','ACC-PROD-22166-GBSOMS','ACC-NPRD-22196-veMon','ACC-PROD-22196-veMon','ACC-NPRD-22203-CCDW','ACC-PROD-22203-CCDW','ACC-NPRD-22212-RANFT','ACC-PROD-22212-RANFT','ACC-NPRD-22255-A51','ACC-PROD-22255-A51','ACC-NPRD-22258-WCMD','ACC-PROD-22258-WCMD','ACC-NPRD-22298-IDMS','ACC-PROD-22298-IDMS','ACC-NPRD-22344-ABFSWeb','ACC-PROD-22344-ABFSWeb','ACC-NPRD-22349-NMADB-DBSCID','ACC-PROD-22349-NMADB-DBSCID','ACC-NPRD-22394-ST','ACC-PROD-22394-ST','ACC-NPRD-22397-MTaaS','ACC-PROD-22397-MTaaS','ACC-NPRD-22436-SSIM','ACC-PROD-22436-SSIM','ACC-NPRD-22442-NATR','ACC-PROD-22442-NATR','ACC-NPRD-22446-R3:Niche','ACC-PROD-22446-R3:Niche','ACC-NPRD-22448-R3:SG','ACC-PROD-22448-R3:SG','ACC-NPRD-22463-SEUFOWEB','ACC-PROD-22463-SEUFOWEB','ACC-NPRD-22464-ENMT','ACC-PROD-22464-ENMT','ACC-NPRD-22465-SRE-Metrics','ACC-PROD-22465-SRE-Metrics','ACC-NPRD-22470-AET','ACC-PROD-22470-AET','ACC-NPRD-22471-OWBS','ACC-PROD-22471-OWBS','ACC-NPRD-22475-PRM','ACC-PROD-22475-PRM','ACC-NPRD-22509-GRID-GDDN','ACC-PROD-22509-GRID-GDDN','ACC-NPRD-22510-GRID-AC','ACC-PROD-22510-GRID-AC','ACC-NPRD-22512-TONGO','ACC-PROD-22512-TONGO','ACC-NPRD-22524-NetOps_Web','ACC-PROD-22524-NetOps_Web','ACC-NPRD-22538-Cricket ABI-Internal','ACC-NPRD-22538-Cricket ABI-Internal PoC','ACC-PROD-22538-Cricket ABI-Internal','ACC-NPRD-22542-HVDTools','ACC-PROD-22542-HVDTools','ACC-PROD-22579-TALLY','ACC-NPRD-22592-GWS','ACC-PROD-22592-GWS','ACC-NPRD-22602-CPS','ACC-PROD-22602-CPS','ACC-NPRD-22606-ASI','ACC-PROD-22606-ASI','ACC-NPRD-22623-DATABANK','ACC-PROD-22623-DATABANK','ACC-NPRD-22639-ESODATA','ACC-PROD-22639-ESODATA','ACC-NPRD-22689-NSBP','ACC-PROD-22689-NSBP','ACC-NPRD-22765-CART','ACC-PROD-22765-CART','ACC-NPRD-22766-LS-EPC','ACC-PROD-22766-LS-EPC','ACC-NPRD-22770-OPCC','ACC-PROD-22770-OPCC','ACC-NPRD-22772-HRM','ACC-PROD-22772-HRM','ACC-NPRD-22786-MERV','ACC-PROD-22786-MERV','ACC-NPRD-22787-Sales Express','ACC-PROD-22787-Sales Express','ACC-NPRD-22790-astra.core','ACC-NPRD-22790-AstraAzureCrossTenantTest','ACC-PROD-22790-astra.core','ACC-NPRD-22793-TPRPTG','ACC-PROD-22793-TPRPTG','ACC-NPRD-22805-ATT-BRAND-CENTER','ACC-PROD-22805-ATT-BRAND-CENTER','ACC-NPRD-22806-Newsroom','ACC-PROD-22806-Newsroom','ACC-NPRD-22808-Copyright Infringement','ACC-PROD-22808-Copyright Infringement','ACC-NPRD-22811-AGSBiller','ACC-PROD-22811-AGSBiller','ACC-NPRD-22813-GCPNT','ACC-PROD-22813-GCPNT','ACC-NPRD-22827-Amp-MM-Invenio','ACC-PROD-22827-Amp-MM-Invenio','ACC-NPRD-22830-AAF','ACC-PROD-22830-AAF','ACC-NPRD-22832-GMBRT','ACC-PROD-22832 -GMBRT','ACC-NPRD-22848-DLAQM','ACC-PROD-22848-DLAQM','ACC-NPRD-22858-EPPT','ACC-PROD-22858-EPPT','ACC-NPRD-22859-SMSD','ACC-PROD-22859-SMSD','ACC-NPRD-22867-VTRP','ACC-PROD-22867-VTRP','ACC-NPRD-22891-SCReporting','ACC-PROD-22891-SCReporting','ACC-NPRD-22895-netoneportal','ACC-PROD-22895-netoneportal','ACC-NPRD-22901-CLOSENUPh','ACC-PROD-22901-CLOSENUPH','ACC-NPRD-22904-UFORMETPORTAL','ACC-PROD-22904-UFORMETPORTAL','ACC-NPRD-22913-BMS-E','ACC-PROD-22913-BMS-E','ACC-NPRD-22927-MOOSE','ACC-PROD-22927-MOOSE','ACC-NPRD-22932-AAO','ACC-PROD-22932-AAO','ACC-NPRD-23007-SSDF','ACC-PROD-23007-SSDF','ACC-NPRD-23012-FESRA','ACC-PROD-23012-FESRA','ACC-NPRD-23013-SONDRE','ACC-PROD-23013-SONDRE','ACC-PROD-31317-BCeBill_Globys','ACC-NPRD-23022-FBBSERV','ACC-PROD-23022-FBBSERV','ACC-NPRD-23069-TicketSearch','ACC-PROD-23069-TicketSearch','ACC-NPRD-23071-WebPPM','ACC-PROD-23071-WebPPM','ACC-NPRD-23095-PORT','ACC-PROD-23095-PORT','ACC-NPRD-23102-CADQQT','ACC-PROD-23102-CADQQT','ACC-PROD-23139-APIRPT','ACC-NPRD-23159-AIMSS','ACC-PROD-23159-AIMSS','ACC-NPRD-23203-RANDB','ACC-PROD-23203-RANDB','ACC-NPRD-23228-CRE WAM','ACC-PROD-23228-CRE WAM','ACC-NPRD-23242-SMLS','ACC-PROD-23242-SMLS','ACC-NPRD-23243-CRE-EMS-U&SS','ACC-PROD-23243-CRE-EMS-U&SS','ACC-NPRD-23273-3QT','ACC-PROD-23273-3QT','ACC-NPRD-23278-EOE','ACC-PROD-23278-EOE','ACC-NPRD-23284-BICT','ACC-PROD-23284-BICT','ACC-NPRD-23288-ATS-ASG-PSL-DEV','ACC-PROD-23288-ATS-ASG-PSL-DEV','ACC-NPRD-23292-CPFM','ACC-PROD-23292-CPFM','ACC-NPRD-23302-SDST','ACC-PROD-23302-SDST','ACC-NPRD-23310-iBwaveUnity','ACC-PROD-23310-iBwaveUnity','ACC-NPRD-23356-SPMA','ACC-PROD-23356-SPMA','ACC-NPRD-23377-GRP-EQE Mobility PE','ACC-PROD-23377-GRP-EQE Mobility PE','ACC-NPRD-23391-BugBounty','ACC-PROD-23391-BugBounty','ACC-NPRD-23449-HRNEXUS','ACC-PROD-23449-HRNEXUS','ACC-NPRD-23464-BEAM','ACC-PROD-23464-BEAM','ACC-NPRD-23468-DOT','ACC-PROD-23468-DOT','ACC-NPRD-23480-GAMIT','ACC-PROD-23480-GAMIT','ACC-NPRD-23488-OCE','ACC-PROD-23488-OCE','ACC-NPRD-23510-DH','ACC-PROD-23510-DH','ACC-NPRD-23512-iSpectrum','ACC-PROD-23512-iSpectrum','ACC-NPRD-23518-Flexera','ACC-PROD-23518-Flexera','ACC-NPRD-23523-BERT.','ACC-PROD-23523-BERT.','ACC-NPRD-23552-EIPAM','ACC-PROD-23552-EIPAM','ACC-NPRD-23563-DPA Portal','ACC-PROD-23563-DPA Portal','ACC-PROD-23574-CARS','ACC-NPRD-23576-SRC Archer','ACC-PROD-23576-SRC Archer','ACC-NPRD-23589-HR-Boomi','ACC-PROD-23589-HR-Boomi','ACC-NPRD-23597-DREAM','ACC-PROD-23597-DREAM','ACC-NPRD-23602-CCGW_IOTGW','ACC-PROD-23602-CCGW_IOTGW','ACC-NPRD-23634-UVN FORT','ACC-PROD-23634-UVN FORT','ACC-NPRD-23654-DES-CoE','ACC-PROD-23654-DES-CoE','ACC-NPRD-23669-CDP','ACC-NPRD-23669-CDP-RUNTIMECI','ACC-NPRD-23669-CDP-TOPOLOGY','ACC-PROD-23669-CDP','ACC-PROD-23669-CDP-TOPOLOGY','ACC-NPRD-23684-ProDocs','ACC-PROD-23684-ProDocs','ACC-NPRD-23732-CSOResearchWebsite','ACC-PROD-23732-CSOResearchWebsite','ACC-NPRD-23738-ECAT','ACC-PROD-23738-ECAT','ACC-NPRD-23745-OVALS NSP RI','ACC-PROD-23745-OVALS NSP RI','ACC-NPRD-23748-Shorten','ACC-PROD-23748-SHORTEN','ACC-NPRD-23788-ACE','ACC-PROD-23788-ACE','ACC-NPRD-23822-CSO-FORENSICS','ACC-PROD-23822-CSO-FORENSICS','ACC-NPRD-23825-WITv2','ACC-PROD-23825-WITv2','ACC-NPRD-23827-POD','ACC-PROD-23827-POD','ACC-NPRD-23835-PrameshPNW','ACC-PROD-23835-PrameshPNW','ACC-NPRD-23844-iDeskOp','ACC-PROD-23844-iDeskOp','ACC-NPRD-23860-LDBoR','ACC-PROD-23860-LDBoR','ACC-NPRD-23880-CNS','ACC-PROD-23880-CNS','ACC-NPRD-23907-ABS INDIRECT MULE','ACC-PROD-23907-ABS INDIRECT MULE','ACC-NPRD-23922-APCDSS','ACC-PROD-23922-APCDSS','ACC-NPRD-23929-DQC','ACC-PROD-23929-DQC','ACC-NPRD-23932-Beach','ACC-PROD-23932-Beach','ACC-NPRD-23935-Enterprise UI','ACC-PROD-23935-Enterprise UI','ACC-NPRD-23938-PPA','ACC-PROD-23938-PPA','ACC-NPRD-24100-ADX_Commercial_ServProv','ACC-NPRD-24100-NC NBO','ACC-NPRD-24100-NC NBO Test 1','ACC-NPRD-24100-NC NBO Test 2','ACC-PROD-24100-ADX_Commercial_ServProv','ACC-PROD-24100-NC NBO','ATT CommericalNetBond .1Q ServMngt','ATT CommericalNetBond Q-in-Q ServMngt','ATT CommericalNetBond Q-in-Q Test','ACC-NPRD-24111-ERD','ACC-PROD-24111-ERD','ACC-NPRD-24168-CSORPT','ACC-PROD-24168-CSORPT','ACC-NPRD-24174-VertexM','ACC-PROD-24174-VertexM','ACC-NPRD-24221-ETCO DR','ACC-NPRD-24228-GCSS-GRC','ACC-PROD-24228-GCSS-GRC','ACC-NPRD-24236-ABMReport','ACC-PROD-24236-ABMReport','ACC-NPRD-24247-4GNetSim','ACC-PROD-24247-4GNetSim','ACC-NPRD-24256-DCAE','ACC-PROD-24256-DCAE','ACC-NPRD-24263-iTIC','ACC-PROD-24263-iTIC','ACC-NPRD-24267-MBPT','ACC-PROD-24267-MBPT','ACC-NPRD-24282-ELA PSORO','ACC-PROD-24282-ELA PSORO','ACC-NPRD-24283-P1','ACC-PROD-24283-P1','ACC-NPRD-24285-wifi-gs','ACC-PROD-24285-wifi-gs','ACC-NPRD-24286-APWB','ACC-PROD-24286-APWB','ACC-NPRD-24288-BIRDe','ACC-PROD-24288-BIRDe','ACC-NPRD-24296-BASS','ACC-PROD-24296-BASS','ACC-NPRD-24298-YOUACHIEVE','ACC-PROD-24298-YOUACHIEVE','ACC-NPRD-24317-ELD','ACC-PROD-24317-ELD','ACC-NPRD-24322-KEPLER-FirstNet','ACC-PROD-24322-KEPLER-FirstNet','ACC-NPRD-24333-IGEMSQM','ACC-PROD-24333-IGEMSQM','ACC-NPRD-24352-FBOAudit','ACC-PROD-24352-FBOAudit','ACC-NPRD-24394-BMA','ACC-PROD-24394-BMA','ACC-NPRD-24395-netac-web','ACC-PROD-24395-netac-web','ACC-NPRD-24404-GRP-SRE','ACC-NPRD-24413-vMMSC','ACC-PROD-24413-vMMSC','ACC-NPRD-24428-bCI_6900 DB','ACC-PROD-24428-bCI_6900 DB','ACC-NPRD-24444-FRVT','ACC-PROD-24444-FRVT','ACC-NPRD-24455-LOBI','ACC-PROD-24455-LOBI','ACC-NPRD-24462-CMDB','ACC-PROD-24462-CMDB','ACC-NPRD-24481-VTM','ACC-PROD-24481-VTM','ACC-NPRD-24483-SER_SAQ_SQL_Server','ACC-PROD-24483-SER_SAQ_SQL_Server','ACC-NPRD-24517-RSCHEDULE','ACC-PROD-24517-RSCHEDULE','ACC-NPRD-24520-DARE','ACC-PROD-24520-DARE','ACC-NPRD-24523-SAART Tools','ACC-PROD-24523-SAART Tools','ACC-NPRD-24552-TSC','ACC-PROD-24552-TSC','ACC-NPRD-24597-CCSC','ACC-PROD-24597-CCSC','ACC-NPRD-24633-MDE','ACC-PROD-24633-MDE','ACC-NPRD-24648-VLSA','ACC-PROD-24648-VLSA','ACC-NPRD-24654-SCO','ACC-PROD-24654-SCO','ACC-NPRD-24800-DTV-RCA','ACC-PROD-24800-DTV-RCA','ACC-NPRD-24802-ASMMR','ACC-PROD-24802-ASMMR','ACC-NPRD-24820 -DTV-ARCHER','ACC-PROD-24820 -DTV-ARCHER','ACC-NPRD-24827-DTV-AUTOSYS','ACC-PROD-24827-DTV-AUTOSYS','ACC-NPRD-24835-DTV-C3','ACC-PROD-24835-DTV-C3','ACC-NPRD-24857-DTV-CASH','ACC-PROD-24857-DTV-CASH','ACC-NPRD-24863-DTV-DWS','ACC-PROD-24863-DTV-DWS','ACC-NPRD-24880-DTV-ECS Com','ACC-PROD-24880-DTV-ECS Com','ACC-NPRD-24913-DTV-ISS','ACC-PROD-24913-DTV-ISS','ACC-NPRD-24940-DTV-LIL','ACC-PROD-24940-DTV-LIL','ACC-NPRD-24943-DTV-MADJ','ACC-PROD-24943-DTV-MADJ','ACC-PROD-24951-DTV-EXCHANGE','ACC-NPRD-24956-DTV-MOVEIT','ACC-PROD-24956-DTV-MOVEIT','ACC-NPRD-24968-DTV-ODI','ACC-PROD-24968-DTV-ODI','ACC-NPRD-24976-DTV-OM','ACC-PROD-24976-DTV-OM','ACC-NPRD-24979-DTV-PARIS','ACC-PROD-24979-DTV-PARIS','ACC-NPRD-25030-DTV-CAMC RECON','ACC-PROD-25030-DTV-CAMC RECON','ACC-NPRD-25044-DTV-TRS','ACC-PROD-25044-DTV-TRS','ACC-NPRD-25050-DTV-TAOS','ACC-PROD-25050-DTV-TAOS','ACC-NPRD-25059-DTV-WS_FTP','ACC-PROD-25059-DTV-WS_FTP','ACC-NPRD-25065-DTV-COMMERCIAL-MASTER-BILLING','ACC-PROD-25065-DTV-COMMERCIAL-MASTER-BILLING','ACC-NPRD-25103-iTrack','ACC-PROD-25103-iTrack','ACC-NPRD-25114-AVERTACK','ACC-PROD-25114-Avertack','ACC-NPRD-25125-vpns','ACC-PROD-25125-vpns','ACC-NPRD-25145-Dynatrace','ACC-PROD-25145-Dynatrace','ACC-NPRD-25149-RepoCentral','ACC-PROD-25149-RepoCentral','ACC-NPRD-25154-TFN Inventory','ACC-PROD-25154-TFN Inventory','ACC-NPRD-25169-NextGenPortal','ACC-PROD-25169-NextGenPortal','ACC-NPRD-25172-DET Search','ACC-PROD-25172-DET Search','ACC-NPRD-25184-Scoop','ACC-PROD-25184-Scoop','ACC-PROD-25196-SPE WEBPAGE','ACC-NPRD-25215-FlowDev','ACC-PROD-25215-FlowDev','ACC-NPRD-25223-DTV-STMSLRPD','ACC-PROD-25223-DTV-STMSLRPD','ACC-NPRD-25224-DTV-TCS','ACC-PROD-25224-DTV-TCS','ACC-NPRD-25229-DTV-Tactical OPR','ACC-PROD-25229-DTV-Tactical OPR','ACC-NPRD-25233-NC Cloudmeter','ACC-PROD-25233-NC Cloudmeter','ACC-NPRD-25279-SANOT','ACC-PROD-25279-SANOT','ACC-NPRD-25293 -DTV-Tracker','ACC-PROD-25293 -DTV-Tracker','ACC-NPRD-25348-vOTA','ACC-PROD-25348-vOTA','ACC-NPRD-25358-Conexus BPACA','ACC-PROD-25358-Conexus BPACA','ACC-NPRD-25359-IGRA','ACC-PROD-25359-IGRA','ACC-NPRD-25366-Cricket Online-Internal','ACC-PROD-25366-Cricket Online','ACC-NPRD-25378-PERSEPHONE','ACC-PROD-25378-PERSEPHONE','ACC-NPRD-25389-EDTT','ACC-PROD-25389-EDTT','ACC-NPRD-25401-DTV-eCat','ACC-PROD-25401-DTV-eCat','ACC-NPRD-25416-DTV-Informatica-Cloud','ACC-PROD-25416-DTV-Informatica-Cloud','ACC-NPRD-25436-DTV-Unified Shopping Cart','ACC-PROD-25436-DTV-Unified Shopping Cart','ACC-NPRD-25460-ST_OSSLITE','ACC-PROD-25460-ST_OSSLITE','ACC-NPRD-25872-(FED) - YODA','ACC-PROD-25872-(FED) - YODA','ACC-NPRD-25886-CodeCloud','ACC-PROD-25886-CodeCloud','ACC-NPRD-25887-DLTN','ACC-PROD-25887-DLTN','ACC-NPRD-25898-MOBNT-Adaptive AntiSpam Email/SMS','ACC-PROD-25898-MOBNT-Adaptive AntiSpam Email/SMS','ACC-NPRD-25900-vSPAM-MMS','ACC-PROD-25900-vSPAM-MMS','ACC-NPRD-25938-ACMS','ACC-PROD-25938-ACMS','ACC-NPRD-25940-Checkmarx Software','ACC-PROD-25940-Checkmarx Software','ACC-NPRD-25944-DTV-Post Bill Adjustment','ACC-PROD-25944-DTV-Post Bill Adjustment','ACC-NPRD-25946-DTV-SPC Web Portal','ACC-PROD-25946-DTV-SPC Web Portal','ACC-NPRD-25955-C-FT','ACC-PROD-25955-C-FT','ACC-NPRD-25959-NHYODA','ACC-PROD-25959-NHYODA','ACC-NPRD-25983-DTV-UPIS','ACC-PROD-25983-DTV-UPIS','ACC-NPRD-25992-iApprove','ACC-PROD-25992-iApprove','ACC-NPRD-25999-AutoTicketing','ACC-PROD-25999-AutoTicketing','ACC-NPRD-26001-LRSI','ACC-PROD-26001-LRSI','ACC-NPRD-26011-IDF','ACC-PROD-26011-IDF','ACC-NPRD-26015-iQ Insights','ACC-PROD-26015-iQ Insights','ACC-NPRD-26018-SAPMP','ACC-PROD-26018-SAPMP','ACC-NPRD-26026-CROME','ACC-PROD-26026-CROME','ACC-NPRD-26066-FeedBackCenter','ACC-PROD-26066-FeedBackCenter','ACC-NPRD-26098-R3:FIND','ACC-PROD-26098-R3:FIND','ACC-NPRD-26121-R3:LAPS','ACC-PROD-26121-R3:LAPS','ACC-NPRD-26146-CKTTC','ACC-PROD-26146-CKTTC','ACC-NPRD-26185-CARC','ACC-PROD-26185-CARC','ACC-NPRD-26193-HRDataHub','ACC-PROD-26193-HRDataHub','ACC-NPRD-26231-ATT CCT Enterprise Reporting Data Lake','ACC-PROD-26231-ATT CCT Enterprise Reporting Data Lake','ACC-PROD-26231-CQM Storage','ACC-NPRD-26237-FUSE','ACC-PROD-26237-FUSE','ACC-NPRD-26277-ChiScan 2.0','ACC-PROD-26277-ChiScan 2.0','ACC-NPRD-26280-GCSBPO','ACC-PROD-26280-GCSBPO','ACC-NPRD-26292-PDAS','ACC-NPRD-26317-CLOA','ACC-PROD-26317-CLOA','ACC-NPRD-26321-DTV-Oscar Reporting','ACC-PROD-26321-DTV-Oscar Reporting','ACC-NPRD-26330-ONESTOP','ACC-PROD-26330-ONESTOP','ACC-NPRD-26340-NPMC Reporting','ACC-PROD-26340-NPMC Reporting','ACC-NPRD-26366-CSMC','ACC-PROD-26366-CSMC','ACC-NPRD-26375-DM','ACC-PROD-26375-DM','ACC-NPRD-26397-mhsps.it.att.com','ACC-PROD-26397-mhsps.it.att.com','ACC-NPRD-26433-TFDE','ACC-PROD-26433-TFDE','ACC-NPRD-26444-EBS-CR-CREATION','ACC-PROD-26444-EBS-CR-CREATION','ACC-NPRD-26484-fdry_dev','ACC-NPRD-26486-BS&R Support','ACC-PROD-26486-BS&R Support','ACC-NPRD-26501-SEI','ACC-PROD-26501-SEI','ACC-NPRD-26535-MOWFM','ACC-PROD-26535-MOWFM','ACC-NPRD-26634-Mercury','ACC-PROD-26634-Mercury','ACC-NPRD-26650-ALERT','ACC-PROD-26650-ALERT','ACC-NPRD-26718-TMT','ACC-PROD-26718-TMT','ACC-NPRD-26727-MSSTMP','ACC-PROD-26727-MSSTMP','ACC-NPRD-26908-AOFLOW','ACC-PROD-26908-AOFLOW','ACC-NPRD-26920-MSSUPM','ACC-PROD-26920-MSSUPM','ACC-NPRD-26948-CSVT','ACC-NPRD-26950-DTV-BO-UPS','ACC-PROD-26950-DTV-BO-UPS','ACC-NPRD-26967-SC-SPI','ACC-PROD-26967-SC-SPI','ACC-NPRD-26970-HRJRULES','ACC-PROD-26970-HRJRULES','ACC-NPRD-27000-DARTS','ACC-PROD-27000-DARTS','ACC-NPRD-27028-LOMT','ACC-PROD-27028-LOMT','ACC-NPRD-27049-ATTFLEET','ACC-PROD-27049-ATTFLEET','ACC-NPRD-27057-WELM','ACC-PROD-27057-WELM','ACC-NPRD-27092-DTVTACTICALIO','ACC-PROD-27092-DTVTACTICALIO','ACC-NPRD-27111-ADEPTweb','ACC-PROD-27111-ADEPTweb','ACC-NPRD-27112-LNDSCP','ACC-PROD-27112-LNDSCP','ACC-NPRD-27121-UCID','ACC-PROD-27121-UCID','ACC-NPRD-27123-DTV-Tactical Bulk Additional Receivers','ACC-PROD-27123-DTV-Tactical Bulk Additional Receivers','ACC-PROD-27133-Cricket-IT Retail Technology','ACC-NPRD-27146-BA','ACC-PROD-27146-BA','ACC-NPRD-27159-ODB','ACC-PROD-27159-ODB','ACC-NPRD-27182-MILO','ACC-PROD-27182-MILO','ACC-NPRD-27213-UTMS','ACC-PROD-27213-UTMS','ACC-NPRD-27257-SCCSP','ACC-PROD-27257-SCCSP','ACC-NPRD-27267-FASTBPM','ACC-PROD-27267-FASTBPM','ACC-NPRD-27299-CDPPIPELINE','ACC-PROD-27299-CDPPIPELINE','ACC-NPRD-27336-WA','ACC-PROD-27336-WA','ACC-NPRD-27341-DTV-CTS','ACC-PROD-27341-DTV-CTS','ACC-NPRD-27355-MCOM','ACC-NPRD-27374-EO-FBC','ACC-PROD-27374-EO-FBC','ACC-NPRD-27415-ATES','ACC-PROD-27415-ATES','ACC-NPRD-27429-OTS','ACC-PROD-27429-OTS','ACC-NPRD-27430-CS-Fusion','ACC-PROD-27430-CS-Fusion','ACC-NPRD-27432-CS-ETL','ACC-PROD-27432-CS-ETL','ACC-NPRD-27433-CS-MON','ACC-PROD-27433-CS-MON','ACC-NPRD-27434-SmartForms','ACC-PROD-27434-SmartForms','ACC-NPRD-27435-UBAM','ACC-PROD-27435-UBAM','ACC-NPRD-27438-KEPLER-SSOT','ACC-PROD-27438-KEPLER-SSOT','ACC-NPRD-27444-PIL','ACC-PROD-27444-PIL','ACC-NPRD-27446-DCS OSM','ACC-PROD-27446-DCS OSM','ACC-NPRD-27452-CSOPCSecurityArchitecture','ACC-NPRD-27477-GBS','ACC-PROD-27477-GBS','ACC-NPRD-27489-C3','ACC-PROD-27489-C3','ACC-NPRD-27670-EEIM Analytics','ACC-PROD-27670-EEIM Analytics','ACC-NPRD-27803-LCMT','ACC-PROD-27803-LCMT','ACC-NPRD-27805-IMPACT','ACC-PROD-27805-IMPACT','ACC-NPRD-27825-OLI','ACC-PROD-27825-OLI','ACC-NPRD-27840-SECST','ACC-PROD-27840-SECST','ACC-NPRD-27848-TechOps-TWiki','ACC-PROD-27848-TechOps-TWiki','ACC-NPRD-27849-DLCOE','ACC-PROD-27849-DLCOE','ACC-NPRD-27884-TeamDB','ACC-PROD-27884-TeamDB','ACC-NPRD-27885-nextgendc','ACC-PROD-27885-nextgendc','ACC-NPRD-27911-DTV-PRODFACTORY','ACC-PROD-27911-DTV-PRODFACTORY','ACC-NPRD-27915-EGDTV Tools','ACC-PROD-27915-EGDTV Tools','ACC-NPRD-27916-SP','ACC-PROD-27916-SP','ACC-NPRD-27993-Amp-BI - MyBI','ACC-PROD-27993-Amp-BI - MyBI','ACC-NPRD-28022-MMPMO','ACC-PROD-28022-MMPMO','ACC-NPRD-28028-iTriage','ACC-PROD-28028-iTriage','ACC-NPRD-28029-FASTAD','ACC-PROD-28029-FASTAD','ACC-NPRD-28033-DDO','ACC-PROD-28033-DDO','ACC-NPRD-28045-SVU','ACC-PROD-28045-SVU','ACC-NPRD-28046-Microsoft SQL Server 2016 SE','ACC-PROD-28046-Microsoft SQL Server 2016 SE','ACC-NPRD-28053-NBFW-CC','ACC-PROD-28053-NBFW-CC','ACC-NPRD-28056-T APM','ACC-PROD-28056-T APM','ACC-NPRD-28060-TRUE','ACC-PROD-28060-TRUE','ACC-NPRD-28062-AMVOTS','ACC-PROD-28062-AMVOTS','ACC-NPRD-28067-iGEMS-SMP','ACC-PROD-28067-iGEMS-SMP','ACC-NPRD-28070-AFSCP','ACC-PROD-28070-AFSCP','ACC-NPRD-28071-iGEMS-APC Main','ACC-PROD-28071-iGEMS-APC Main','ACC-NPRD-28073-NSSA','ACC-PROD-28073-NSSA','ACC-NPRD-28083-IGEMSNG','ACC-PROD-28083-IGEMSNG','ACC-NPRD-28105-i2T','ACC-PROD-28105-i2T','ACC-NPRD-28126-Amp-MP-AMP','ACC-PROD-28126-Amp-MP-AMP','ACC-NPRD-28140-AmdocsInfraTool','ACC-PROD-28140-AmdocsInfraTool','ACC-NPRD-28150-Amp-MD','ACC-PROD-28150-Amp-MD','ACC-NPRD-28151-CCDV-SE','ACC-PROD-28151-CCDV-SE','ACC-NPRD-28163-TACs','ACC-PROD-28163-TACS','ACC-NPRD-28165-DEAS','ACC-PROD-28165-DEAS','ACC-NPRD-28175-TS Tracker','ACC-PROD-28175-TS Tracker','ACC-NPRD-28205-ALP','ACC-PROD-28205-ALP','ACC-NPRD-28209-AutoChat','ACC-PROD-28209-AutoChat','ACC-NPRD-28216-VERTEX','ACC-PROD-28216-VERTEX','ACC-NPRD-28238-Lighthouse','ACC-PROD-28238-Lighthouse','ACC-NPRD-28247-BKWeb','ACC-PROD-28247-BKWeb','ACC-NPRD-28248-MDUAP','ACC-PROD-28248-MDUAP','ACC-NPRD-28258-CDO-TABLEAU','ACC-PROD-28258-CDO-TABLEAU','ACC-NPRD-28266-AURA','ACC-PROD-28266-AURA','ACC-NPRD-28282 -CCCI_MSSQL','ACC-PROD-28282 -CCCI_MSSQL','ACC-NPRD-28291-CoreImpact','ACC-PROD-28291-CoreImpact','ACC-NPRD-28303-ASPDDoS','ACC-NPRD-28307-DECH','ACC-NPRD-28310-VMS','ACC-PROD-28310-VMS','ACC-NPRD-28319-RCT','ACC-PROD-28319-RCT','ACC-NPRD-28340-CICDSB','ACC-PROD-28340-CICDSB','ACC-NPRD-28344-BCS_REPORTINGSERVER','ACC-PROD-28344-BCS_REPORTINGSERVER','ACC-NPRD-28350-FINROBODASH','ACC-PROD-28350-FINROBODASH','ACC-NPRD-28353-AOFlowFED','ACC-PROD-28353-AOFlowFED','ACC-NPRD-28363-SZTP','ACC-PROD-28363-SZTP (HGPHS PROD)','ACC-NPRD-28364-MLP','ACC-PROD-28364-MLP','ACC-NPRD-28408-BUSMKT-LMP','ACC-PROD-28408-BUSMKT-LMP','ACC-NPRD-28432-Kepler-EDGE','ACC-PROD-28432-Kepler-EDGE','ACC-NPRD-28467-CREWPA','ACC-PROD-28467-CREWPA','PC-Solution-Arch-Bastion','ACC-NPRD-28532-GT3 Tipster2','ACC-PROD-28532-GT3 Tipster2','ACC-NPRD-28558-ASLA-DSLA','ACC-PROD-28558-ASLA-DSLA','ACC-NPRD-28587-ATO_IOT-DM_OPS_PORTAL','ACC-PROD-28587-ATO_IOT-DM_OPS_PORTAL','ACC-NPRD-28601-CCPT','ACC-PROD-28601-CCPT','ACC-NPRD-28605-CDO-ENTERPRISE-POWER-BI','ACC-PROD-28605-CDO -ENTERPRISE-POWER-BI','ACC-NPRD-28609-AOD','ACC-PROD-28609-AOD','ACC-NPRD-28611-SoftPhone','ACC-PROD-28611-SoftPhone','ACC-NPRD-28612-MAG','ACC-PROD-28612-MAG','ACC-NPRD-28613-CIT','ACC-PROD-28613-CIT','ACC-NPRD-28619-Atlast-UI','ACC-PROD-28619-Atlast-UI','ACC-NPRD-28622-RTOOLS','ACC-PROD-28622-RTOOLS','ACC-NPRD-28640-ZABBiX','ACC-PROD-28640-LSREC-ZABBIX','ACC-NPRD-28648-WOLFCAP','ACC-PROD-28648-WOLFCAP','ACC-NPRD-28649-AUTOGSD','ACC-PROD-28649-AUTOGSD','ACC-NPRD-28650-MOBAPPS','ACC-PROD-28650-MOBAPPS','ACC-NPRD-28656-WBDMR','ACC-PROD-28656-WBDMR','ACC-NPRD-28658-BAEM','ACC-PROD-28658-BAEM','ACC-NPRD-28677-SDDA','ACC-PROD-28677-SDDA','ACC-NPRD-28693-LGW','ACC-NPRD-28693-LGW-LOGS','ACC-PROD-28693-LGW','ACC-PROD-28693-LGW-LOGS','ACC-NPRD-28696-CSMonitoring','ACC-PROD-28696-CSMonitoring','ACC-NPRD-28713-AVA','ACC-PROD-28713-AVA','ACC-NPRD-28734-Cricket akt POS','ACC-PROD-28734-Cricket akt POS','ACC-NPRD-28769-MOKA DOJO','ACC-PROD-28769-MOKA DOJO','ACC-NPRD-28786-FMW','ACC-PROD-28786-FMW','ACC-NPRD-28789-Amdocs Automation Tools','ACC-PROD-28789-Amdocs Automation Tools','ACC-NPRD-28832-CSOPOC_rh267n','ACC-NPRD-28833-GRT','ACC-PROD-28833-GRT','ACC-NPRD-28880-Pinnacle','ACC-NPRD-28891-RCC','ACC-PROD-28891-RCC','ACC-NPRD-28894-Apprise','ACC-PROD-28894-Apprise','ACC-NPRD-28907-MICAPI','ACC-PROD-28907-MICAPI','ACC-NPRD-28913-TAPS-BOSS-Automation','ACC-PROD-28913-TAPS-BOSS-Automation','ACC-NPRD-28914-GESSDOT','ACC-PROD-28914-GESSDOT','ACC-NPRD-28917-BizOps','ACC-PROD-28917-BizOps','ACC-NPRD-28922-TEMPO','ACC-PROD-28922-TEMPO','ACC-NPRD-28958-Logistyx','ACC-PROD-28958-Logistyx','ACC-NPRD-29001-BSET','ACC-PROD-29001-BSET','ACC-NPRD-29010-HDFINGESTION','ACC-PROD-29010-HDFINGESTION','ACC-NPRD-29020-ROSTER','ACC-PROD-29020-ROSTER','ACC-NPRD-29047-NFSD','ACC-PROD-29047-NFSD','ACC-NPRD-29083-WLNP Veriport','ACC-NPRD-29096-COAR','ACC-PROD-29096-COAR','ACC-NPRD-29124-CFO RATS','ACC-PROD-29124-CFO RATS','ACC-NPRD-29131-BCG QS - Quartz','ACC-PROD-29131-BCG QS - Quartz','ACC-NPRD-29146-PCR','ACC-PROD-29146-PCR','ACC-NPRD-29151-DCT','ACC-PROD-29151-DCT','ACC-NPRD-29181-HDS','ACC-PROD-29181-HDS','ACC-NPRD-29205-R3:SBS','ACC-PROD-29205-R3:SBS','ACC-NPRD-29206-PC-AppSupport','ACC-PROD-29206-PC-AppSupport','ACC-NPRD-29233-RAN-P','ACC-PROD-29233-RAN-P','ACC-NPRD-29265-GBVSAA','ACC-PROD-29265-GBVSAA','ACC-NPRD-29285-VaaS','ACC-PROD-29285-VaaS','ACC-NPRD-29287-AZCLOUDSERVICES','ACC-PROD-29287-AZCLOUDSERVICES','ACC-NPRD-29293-RPET','ACC-PROD-29293-RPET','ACC-NPRD-29310-PAF','ACC-PROD-29310-PAF','ACC-PROD-29315-DTVRIO','ACC-NPRD-29318-NSEPDRSFS','ACC-PROD-29318-NSEPDRSFS','ACC-NPRD-29333-BBW','ACC-PROD-29333-BBW','ACC-NPRD-29341-netbox','ACC-PROD-29341-netbox','ACC-NPRD-29347-Spotlight','ACC-PROD-29347-Spotlight','ACC-NPRD-29349-GRP-ICAP','ACC-PROD-29349-GRP-ICAP','ACC-NPRD-29355-KEPLER','ACC-PROD-29355-KEPLER','ACC-NPRD-29357-PIE','ACC-PROD- 29357-PIE','ACC-NPRD-29358-CNMC','ACC-PROD-29358-CNMC','ACC-NPRD-29384-StataPile','ACC-PROD-29384-StataPile','ACC-PROD-29395-MROS','ACC-NPRD-29415-FTTAUTO','ACC-PROD-29415-FTTAUTO','ACC-NPRD-29427-ATTU','ACC-PROD-29427-ATTU','ACC-NPRD-29463-SCAP','ACC-PROD-29463-SCAP','ACC-NPRD-29474-AVT AS','ACC-PROD-29474-AVT AS','ACC-NPRD-29476-LMPS','ACC-PROD-29476-LMPS','ACC-NPRD-29483-MSSS','ACC-PROD-29483-MSSS','ACC-NPRD-29495-AMT','ACC-PROD-29495-AMT','ACC-NPRD-29564-OSP','ACC-PROD-29564-OSP','ACC-NPRD-29565-PIZCP','ACC-PROD-29565-PIZCP','ACC-NPRD-29572-ASF','ACC-PROD-29572-ASF','ACC-NPRD-29579-AIOPS','ACC-PROD-29579-AIOPS','ACC-NPRD-29591-BIRT-NAFF','ACC-PROD-29591-BIRT-NAFF','ACC-NPRD-29592-MARTECH','ACC-PROD-29592-MARTECH','ACC-NPRD-29597-HCMLink','ACC-PROD-29597-HCMLink','ACC-NPRD-29599-L1-RTA','ACC-PROD-29599-L1-RTA','ACC-NPRD-29605-AP-RAN-FN-NAT-COP','ACC-PROD-29605-AP-RAN-FN-NAT-COP','ACC-NPRD-29612-MNAT','ACC-PROD-29612-MNAT','ACC-NPRD-29630-AutoQM','ACC-PROD-29630-AutoQM','ACC-NPRD-29642-BGELK','ACC-PROD-29642-BGELK','ACC-NPRD-29643-DCO','ACC-PROD-29643-DCO','ACC-NPRD-29649-SUD','ACC-PROD-29649-SUD','ACC-NPRD-29663-LKX','ACC-PROD-29663-LKX','ACC-NPRD-29665-MRAS Logger','ACC-PROD-29665-MRAS Logger','ACC-NPRD-29675-UPM.Prime.Biller','ACC-PROD-29675-UPM.Prime.Biller','ACC-NPRD-29684-NOVA NG','ACC-PROD-29684-NOVA NG','ACC-NPRD-29699-milestone0','ACC-PROD-29699-milestone0','ACC-NPRD-29712-XEIP','ACC-PROD-29712-XEIP','ACC-NPRD-29729-DEEP SS Ingest','ACC-NPRD-29743-CCETR','ACC-PROD-29743-CCETR','ACC-NPRD-29748-HR Oracle Chatbot','ACC-PROD-29748-HR Oracle Chatbot','ACC-NPRD-29760-MaRC-Analytics','ACC-PROD-29760-MaRC-Analytics','ACC-NPRD-29770-MSSPanorama','ACC-PROD-29770-MSSPanorama','ACC-NPRD-29783-CDO-NIA-CA','ACC-PROD-29783-CDO-NIA-CA','ACC-NPRD-29786-ONE','ACC-PROD-29786-ONE','ACC-NPRD-29788-HRAccess','ACC-PROD-29788-HRAccess','ACC-NPRD-29798-vNSP','ACC-PROD-29798-vNSP','ACC-NPRD-29803-ATTBDAS','ACC-PROD-29803-ATTBDAS','ACC-NPRD-29804-T Trace','ACC-PROD-29804-T Trace','ACC-NPRD-29810-Iplanner','ACC-PROD-29810-Iplanner','ACC-NPRD-29815-TRIAGE','ACC-PROD-29815-TRIAGE','ACC-NPRD-29820-HALO-E','ACC-PROD-29820-HALO-E','ACC-NPRD-29822-DDET','ACC-PROD-29822-DDET','ACC-NPRD-29841-OPTIMUS','ACC-PROD-29841-OPTIMUS','ACC-NPRD-29876-LQ','ACC-PROD-29876-LQ','ACC-NPRD-29890-IXP','ACC-PROD-29890-IXP','ACC-NPRD-29906-Vortex','ACC-PROD-29906-Vortex','ACC-PROD-29907-CDO_Snowflake','ACC-NPRD-29920-AFO Portal','ACC-PROD-29920-AFO Portal','ACC-NPRD-29942-Living Unit Intelligence Engine','ACC-PROD-29942-Living Unit Intelligence Engine','ACC-NPRD-29960-TOMP','ACC-PROD-29960-TOMP','ACC-NPRD-29964-EGMDB','ACC-PROD-29964-EGMDB','ACC-NPRD-29966-CCMSMONGODBATLAS','ACC-PROD-29966-CCMSMONGODBATLAS','ACC-NPRD-29973-CROS','ACC-PROD-29973-CROS','ACC-NPRD-29978-The CHAD','ACC-PROD-29978-The CHAD','ACC-NPRD-30006-L2NRC','ACC-PROD-30006-L2NRC','ACC-NPRD-30042-VCON','ACC-PROD-30042-VCON','ACC-NPRD-30050-Bastion-001','ACC-NPRD-30050-PubCloud-Images','ACC-PROD-30050-Bastion-001','ACC-PROD-30050-EDDOS','ACC-PROD-30050-PubCloud-Dedlaw01','ACC-NPRD-30054-APO','ACC-PROD-30054-APO','ACC-NPRD-30097-CDO_SP_Mobility','ACC-PROD-30097-CDO_SP_Mobility','ACC-NPRD-30100-RGLAS','ACC-PROD-30100-RGLAS','ACC-NPRD-30102-CP WFMT','ACC-PROD-30102-CP WFMT','ACC-NPRD-30112-DCSW','ACC-PROD-30112-DCSW','ACC-NPRD-30114-AFCWO','ACC-PROD-30114-AFCWO','ACC-NPRD-30116-iTrack ZETM','ACC-PROD-30116-iTrack ZETM','ACC-NPRD-30117-NQP Infovista','ACC-PROD-30117-NQP Infovista','ACC-NPRD-30162-FINScheduling','ACC-PROD-30162-FINScheduling','ACC-NPRD-30171-CPIM','ACC-PROD-30171-CPIM','ACC-NPRD-30175-Reportal','ACC-PROD-30175-Reportal','ACC-NPRD-30176-Insights-Engine','ACC-PROD-30176-Insights-Engine','ACC-NPRD-30186-PIXI','ACC-PROD-30186-PIXI','ACC-NPRD-30192-CORPSOX','ACC-PROD-30192-CORPSOX','ACC-NPRD-30215-RTSTATS','ACC-PROD-30215-RTSTATS','ACC-NPRD-30217-FACONV','ACC-PROD-30217-FACONV','ACC-NPRD-30223-PD','ACC-PROD-30223-PD','ACC-NPRD-30226-ATT_ISR_WEBSITE','ACC-PROD-30226-ATT_ISR_Website','ACC-NPRD-30230-GDUI','ACC-PROD-30230-GDUI','ACC-NPRD-30247-MAT','ACC-PROD-30247-MAT','ACC-NPRD-30252-TDM-ETL','ACC-PROD-30252-TDM-ETL','ACC-NPRD-30253-Rainmaker POC','ACC-NPRD-30261-MNP Labs','ACC-PROD-30261-MNP Labs','ACC-NPRD-30276-EPP','ACC-PROD-30276-EPP','ACC-NPRD-30277-AZUREML','ACC-PROD-30277-AZUREML','ACC-NPRD-30279-NESS','ACC-PROD-30279-NESS','ACC-NPRD-30291-SC-LAB','ACC-NPRD-30294-FAMLI','ACC-PROD-30294-FAMLI','ACC-NPRD-30300-WIFIDCI','ACC-PROD-30300-WIFIDCI','ACC-NPRD-30318-AP SDS','ACC-PROD-30318-AP SDS','ACC-NPRD-30325-Monaas','ACC-PROD-30325-Monaas','ACC-NPRD-30333-AZDATALAKE','ACC-PROD-30333-AZDATALAKE','ACC-NPRD-30338-TU Video','ACC-PROD-30338-TU Video','ACC-NPRD-30341-LEP','ACC-PROD-30341-LEP','ACC-NPRD-30342-AIMAX','ACC-PROD-30342-AIMAX','ACC-NPRD-30347-NRD','ACC-PROD-30347-NRD','ACC-NPRD-30358-MyTracker','ACC-PROD-30358-MyTracker','ACC-NPRD-30359-NEXXUS','ACC-PROD-30359-NEXXUS','ACC-NPRD-30363-APOC Infosys','ACC-PROD-30363-APOC Infosys','ACC-NPRD-30371-OScAR-AI','ACC-PROD-30371-OScAR-AI','ACC-NPRD-30385-HR-WEB','ACC-PROD-30385-HR-WEB','ACC-NPRD-30388-ETT','ACC-PROD-30388-ETT','ACC-NPRD-30401-HRCMT','ACC-PROD-30401-HRCMT','ACC-NPRD-30402-AORTS','ACC-PROD-30402-AORTS','ACC-NPRD-30404-CRR Web','ACC-PROD-30404-CRR Web','ACC-NPRD-30417-ATOFleet','ACC-PROD-30417-ATOFleet','ACC-NPRD-30419-RCAP','ACC-PROD-30419-RCAP','ACC-NPRD-30420-SSAF','ACC-PROD-30420-SSAF','ACC-NPRD-30432-NCAW','ACC-PROD-30432-NCAW','ACC-NPRD-30448-MYWIZARD','ACC-PROD-30448-MYWIZARD','ACC-NPRD-30452-PassportTraining','ACC-PROD-30452-PassportTraining','ACC-NPRD-30454-GTPMDB','ACC-PROD-30454-GTPMDB','ACC-NPRD-30480-NQPWPRDB','ACC-PROD-30480-NQPWPRDB','ACC-NPRD-30482-ATTCOMPASS','ACC-PROD-30482-ATTCOMPASS','ACC-NPRD-30484-PASCAL','ACC-PROD-30484-PASCAL','ACC-NPRD-30493-ADIVA','ACC-PROD-30493-ADIVA','ACC-NPRD-30507-ILWIPERF','ACC-PROD-30507-ILWIPERF','ACC-NPRD-30516-NAAP','ACC-PROD-30516-NAAP','ACC-NPRD-30528-SkyRecon','ACC-PROD-30528-SkyRecon','ACC-NPRD-30530-ICAP-SDP','ACC-PROD-30530-ICAP-SDP','ACC-PROD-30535-FBOKB','ACC-NPRD-30543-ABI','ACC-PROD-30543-ABI','ACC-NPRD-30550-SSP','ACC-PROD-30550-SSP','ACC-NPRD-30553-CodeInsights','ACC-PROD-30553-CodeInsights','ACC-NPRD-30554-LCMDB','ACC-PROD-30554-LCMDB','ACC-NPRD-30558-myATT','ACC-PROD-30558-myATT','ACC-NPRD-30561-Rhythm','ACC-PROD-30561-Rhythm','ACC-NPRD-30569-LEVO','ACC-PROD-30569-LEVO','ACC-NPRD-30584-COAT','ACC-PROD-30584-COAT','ACC-NPRD-30612-APPMP','ACC-PROD-30612-APPMP','ACC-NPRD-30621-DEEP','ACC-PROD-30621-DEEP','ACC-NPRD-30625-MVMC','ACC-PROD-30625-MVMC','ACC-NPRD-30632-uDASCloud','ACC-PROD-30632-uDASCloud','ACC-NPRD-30636-Azure-DL','ACC-PROD-30636-Azure-DL','ACC-NPRD-30646-CDPLATFORM','ACC-PROD-30646-CDPLATFORM','ACC-NPRD-30651-AAIMSMR','ACC-PROD-30651-AAIMSMR','ACC-NPRD-30660-INP','ACC-PROD-30660-INP','ACC-NPRD-30661-Arcturus','ACC-PROD-30661-Arcturus','ACC-NPRD-30669-CCS CHF','ACC-PROD-30669-CCS CHF','ACC-PROD-30679-HRWES','ACC-NPRD-30683-CSO-MNST','ACC-PROD-30683-CSO-MNST','ACC-NPRD-30689-RAISR PORTAL','ACC-PROD-30689-RAISR PORTAL','ACC-NPRD-30698-AQE','ACC-PROD-30698-AQE','ACC-NPRD-30699-Everest','ACC-PROD-30699-Everest','ACC-NPRD-30701-ORCA','ACC-PROD-30701-ORCA','ACC-NPRD-30703-Azure-EHA','ACC-PROD-30703-Azure-EHA','ACC-NPRD-30706-VERTICASTR','ACC-PROD-30706-VERTICASTR','ACC-NPRD-30710-DICA01','ACC-NPRD-30710-DICA02','ACC-NPRD-30713-UPM','ACC-PROD-30713-UPM','ACC-NPRD-30714-TQI','ACC-PROD-30714-TQI','ACC-NPRD-30715-GCSTT','ACC-PROD-30715-GCSTT','ACC-NPRD-30722-STELLAR BOS','ACC-PROD-30722-STELLAR BOS','ACC-NPRD-30727-iQBar','ACC-PROD-30727-iQBar','ACC-NPRD-30731-MWA','ACC-PROD-30731-MWA','ACC-NPRD-30741-ARIT','ACC-PROD-30741-ARIT','ACC-NPRD-30745-CallVu','ACC-PROD-30745-CallVu','ACC-NPRD-30754-DMP','ACC-PROD-30754-DMP','ACC-NPRD-30759-newCOBC','ACC-PROD-30759-newCOBC','ACC-NPRD-30761-MOBNT-MGCR20','ACC-PROD-30761-MOBNT-MGCR20','ACC-NPRD-30764 -churn','ACC-PROD-30764 -churn','ACC-NPRD-30765-WIRANOP','ACC-PROD-30765-WIRANOP','ACC-NPRD-30774-CCReporting','ACC-PROD-30774-CCReporting','ACC-NPRD-30777-GRP-FTDAT','ACC-NPRD-30778-AstraAzureDevCSO','ACC-NPRD-30778-AstraAzureMock1DevCSO','ACC-NPRD-30778-AstraAzureMock1PreProdCSO','ACC-NPRD-30778-AstraAzureMock1TestCSO','ACC-NPRD-30778-AstraAzureMock2DevCSO','ACC-NPRD-30778-AstraAzureMock2PreProdCSO','ACC-NPRD-30778-AstraAzureMock2TestCSO','ACC-NPRD-30778-AstraAzureMock3DevCSO','ACC-NPRD-30778-AstraAzureMock3PreProdCSO','ACC-NPRD-30778-AstraAzureMock3TestCSO','ACC-NPRD-30778-AstraAzurePreProdCSO','ACC-NPRD-30778-AstraAzureSandboxCSO','ACC-NPRD-30778-AstraAzureTestCSO','ACC-NPRD-30778-Mock1CSOAON','ACC-PROD-30778-AstraAzureProdCSO','ACC-NPRD-30818-WEBTOOLS','ACC-PROD-30818-WEBTOOLS','ACC-NPRD-30824-Azure RDW','ACC-PROD-30824-Azure RDW','ACC-NPRD-30828-WAP','ACC-PROD-30828-WAP','ACC-NPRD-30831-Azure RDW - ESDDW','ACC-PROD-30831-Azure RDW - ESDDW','ACC-NPRD-30832-Azure RDW - ESAR','ACC-PROD-30832-Azure RDW - ESAR','ACC-NPRD-30834-eSAP','ACC-PROD-30834-eSAP','ACC-NPRD-30840-ACCE','ACC-PROD-30840-ACCE','ACC-NPRD-30842-TUOPS','ACC-PROD-30842-TUOPS','ACC-PROD-30851-SSCFinance','ACC-NPRD-30860-ABRC','ACC-PROD-30860-ABRC','ACC-NPRD-30861-HRSRA','ACC-PROD-30861-HRSRA','ACC-NPRD-30862-AE-M','ACC-PROD-30862-AE-M','ACC-NPRD-30878-FLBE','ACC-PROD-30878-FLBE','ACC-NPRD-30883-T2Z','ACC-PROD-30883-T2Z','ACC-NPRD-30887-PREMIER-ALM','ACC-PROD-30887-PREMIER-ALM','ACC-NPRD-30889-iASCE','ACC-PROD-30889-iASCE','ACC-NPRD-30904-CHIP','ACC-PROD-30904-CHIP','ACC-PROD-30909-BSSe-OC','ACC-NPRD-30917-CompConnect','ACC-PROD-30917-CompConnect','ACC-NPRD-30919-ZETA','ACC-PROD-30919-ZETA','ACC-NPRD-30920-notifyNow','ACC-PROD-30920-notifyNow','ACC-NPRD-30922-GASP','ACC-PROD-30922-GASP','ACC-NPRD-30928-3i','ACC-PROD-30928-3i','ACC-NPRD-30934-MySPM','ACC-PROD-30934-MySPM','ACC-NPRD-30945-BAS','ACC-PROD-30945-BAS','ACC-NPRD-30956-VCIP','ACC-PROD-30956-VCIP','ACC-NPRD-30957-MKT-BCL-CIS','ACC-NPRD-30963-CDO-MARS','ACC-PROD-30963-CDO-MARS','ACC-NPRD-30966-AzNetcool','ACC-PROD-30966-AzNetcool','ACC-NPRD-30968-LMAC','ACC-PROD-30968-LMAC','ACC-NPRD-30973-IRIS','ACC-PROD-30973-IRIS','ACC-NPRD-30981-MECHIDBOT','ACC-PROD-30981-MECHIDBOT','ACC-NPRD-30986-EVO','ACC-PROD-30986-EVO','ACC-NPRD-30992-ICS','ACC-PROD-30992-ICS','ACC-NPRD-30998-TRENDI2.0','ACC-PROD-30998-TRENDI2.0','ACC-NPRD-31004-SOR','ACC-PROD-31004-SOR','ACC-NPRD-31008-TOWERS','ACC-NPRD-31017-MARK IT','ACC-PROD-31017-MARK IT','ACC-NPRD-31020-PAR','ACC-PROD-31020-PAR','ACC-NPRD-31021-RANOPTOOLS','ACC-PROD-31021-RANOPTOOLS','ACC-NPRD-31024-siemsoarservice','ACC-PROD-31024-siemsoarservice','ACC-NPRD-31044-LOD','ACC-PROD-31044-LOD','ACC-NPRD-31048-DATE','ACC-PROD-31048-DATE','ACC-NPRD-31067-CP-2','ACC-PROD-31067-CP-2','ACC-NPRD-31082-NOWIA','ACC-PROD-31082-NOWIA','ACC-NPRD-31085-SYSTOOLSCOE','ACC-PROD-31085-SYSTOOLSCOE','ACC-NPRD-31090-Alienvault-Delivery','ACC-NPRD-31095-NorthStar','ACC-PROD-31095-NorthStar','ACC-NPRD-31098-X-Tool','ACC-PROD-31098-X-Tool','ACC-NPRD-31100-SPEED','ACC-PROD-31100-SPEED','ACC-NPRD-31114-AKV','ACC-NPRD-31114-tCMDB','ACC-PROD-31114-AKV','ACC-PROD-31114-tCMDB','ACC-NPRD-31123-BCT','ACC-PROD-31123-BCT','ACC-NPRD-31125-MOBNT_ASCERT','ACC-PROD-31125-MOBNT_ASCERT','ACC-NPRD-31126-UTrack-Legacy','ACC-PROD-31126-UTrack-Legacy','ACC-NPRD-31127-LSCTool_2','ACC-PROD-31127-LSCTool_2','ACC-NPRD-31128-MOW Scorecard','ACC-PROD-31128-MOW Scorecard','ACC-NPRD-31134-TechM Automation Tools','ACC-PROD-31134-TechM Automation Tools','ACC-NPRD-31139-FBOTS','ACC-PROD-31139-FBOTS','ACC-NPRD-31144-TUAB','ACC-NPRD-31144-TUAB-DTV','ACC-PROD-31144-TUAB','ACC-PROD-31144-TUAB-DTV','ACC-NPRD-31148-DNS-MC','ACC-PROD-31148-DNS-MC','ACC-NPRD-31152-BDAMart 2.0','ACC-PROD-31152-BDAMart 2.0','ACC-NPRD-31168-tWiki','ACC-PROD-31168-tWiki','ACC-NPRD-31171-RO','ACC-PROD-31171-RO','ACC-NPRD-31184-Cerebro','ACC-PROD-31184-Cerebro','ACC-NPRD-31201-AVTKAI','ACC-PROD-31201-AVTKAI','ACC-NPRD-31208-wifi-cloud-conf','ACC-PROD-31208-wifi-cloud-conf','ACC-NPRD-31212-IBCM','ACC-PROD-31212-IBCM','ACC-NPRD-31213-LODF','ACC-PROD-31213-LODF','ACC-NPRD-31215-TUTS','ACC-PROD-31215-TUTS','ACC-NPRD-31218-awtc','ACC-PROD-31218-awtc','ACC-NPRD-31225-OMCA','ACC-PROD-31225-OMCA','ACC-NPRD-31230-TSP','ACC-PROD-31230-TSP','ACC-NPRD-31232-TFR','ACC-PROD-31232-TFR','ACC-NPRD-31235-Azure-Analytics','ACC-PROD-31235-Azure-Analytics','ACC-NPRD-31244-LISA-DHCP','ACC-PROD-31244-LISA-DHCP','ACC-NPRD-31263-CDOPT','ACC-PROD-31263-CDOPT','ACC-NPRD-31278-tView','ACC-PROD-31278-tView','ACC-NPRD-31288-Azure RDW – TLG Reports DM','ACC-PROD-31288-Azure RDW – TLG Reports DM','ACC-NPRD-31292-ISBUS','ACC-PROD-31292-ISBUS','ACC-NPRD-31293-IEBUS','ACC-PROD-31293-IEBUS','ACC-NPRD-31297-Atlantis','ACC-PROD-31297-Atlantis','ACC-NPRD-31298-WatchtowerAI','ACC-PROD-31298-WatchtowerAI','ACC-NPRD-31299-MPA','ACC-PROD-31299-MPA','ACC-NPRD-31301-AIB','ACC-NPRD-31302-PCTCD','ACC-PROD-31302-PCTCD','ACC-NPRD-31305-JVS','ACC-NPRD-31305-JVS-AON-SHARED','ACC-NPRD-31305-JVS-AON-SHARED-PRECERT','ACC-PROD-31305-JVS','ACC-NPRD-31327-One LASRGUI','ACC-PROD-31327-One LASRGUI','ACC-NPRD-31328-RB','ACC-PROD-31328-REDBULL','ACC-NPRD-31329-CASD','ACC-PROD-31329-CASD','ACC-NPRD-31334-Webrope Tool','ACC-PROD-31334-Webrope Tool','ACC-NPRD-31337-IoTProfessionalServices','ACC-PROD-31337-IoTProfessionalServices','ACC-NPRD-31340-ACTP','ACC-PROD-31340-ACTP','ACC-NPRD-31349-CCWRT','ACC-PROD-31349-CCWRT','ACC-NPRD-31350-RunIt','ACC-PROD-31350-RunIt','ACC-NPRD-31352-OCAComm','ACC-PROD-31352-OCAComm','ACC-NPRD-31361-UPST Cloud','ACC-PROD-31361-UPST Cloud','ACC-NPRD-31364-S2C','ACC-PROD-31364-S2C','ACC-NPRD-31367-HCEV','ACC-PROD-31367-HCEV','ACC-NPRD-31374-INLAP','ACC-PROD-31374-INLAP','ACC-NPRD-31379-SBOM-MTTU','ACC-PROD-31379-SBOM-MTTU','ACC-NPRD-31387-CCT MRP','ACC-PROD-31387-CCT MRP','ACC-NPRD-31390-EFK','ACC-PROD-31390-EFK','ACC-NPRD-31392-MW WRL/DSL ROBQ','ACC-PROD-31392-MW WRL/DSL ROBQ','ACC-NPRD-31397-BIRT Shared Cost Model','ACC-PROD-31397-BIRT Shared Cost Model','ACC-NPRD-31401-DATP','ACC-PROD-31401-DATP','ACC-NPRD-31402-IGW','ACC-PROD-31402-IGW','ACC-NPRD-31409-FBOAT','ACC-PROD-31409-FBOAT','ACC-NPRD-31419-Wolfcap - Video','ACC-PROD-31419-Wolfcap - Video','ACC-PROD-31442-StraViso','ACC-NPRD-31448-TPE','ACC-PROD-31448-TPE','ACC-NPRD-31458-MCT','ACC-PROD-31458-MCT','ACC-NPRD-31466-R3:PRI-RERATE','ACC-PROD-31466-R3:PRI-RERATE','ACC-NPRD-31467-IDP-Cloud','ACC-PROD-31467-IDP-Cloud','ACC-NPRD-31469-FRCS','ACC-PROD-31469-FRCS','ACC-NPRD-31473-wifi-cloud-ds','ACC-PROD-31473-wifi-cloud-ds','ACC-NPRD-31474-CQEDA','ACC-PROD-31474-CQEDA','ACC-NPRD-31477-Quicksilver','ACC-PROD-31477-Quicksilver','ACC-NPRD-31484-USPe NCD','ACC-PROD-31484-USPe NCD','ACC-NPRD-31486-UUT','ACC-PROD-31486-UUT','ACC-NPRD-31487 -NIOS','ACC-PROD-31487 -NIOS','ACC-NPRD-31488-TIDE','ACC-PROD-31488-TIDE','ACC-NPRD-31499-DARS','ACC-PROD-31499-DARS','ACC-NPRD-31500-ATIMS','ACC-PROD-31500-ATIMS','ACC-NPRD-31502-ATTCOMM','ACC-PROD-31502-ATTCOMM','ACC-NPRD-31503-Network Activity Log','ACC-PROD-31503-Network Activity Log','ACC-NPRD-31504-OEM-Builder','ACC-PROD-31504-OEM-Builder','ACC-NPRD-31505-MNOC-AT','ACC-PROD-31505-MNOC-AT','ACC-NPRD-31506-IPTC','ACC-PROD-31506-IPTC','ACC-NPRD-31526-SpendAI','ACC-PROD-31526-SpendAI','ACC-NPRD-31532-Material management','ACC-PROD-31532-Material management','ACC-NPRD-31533-AVCR','ACC-PROD-31533-AVCR','ACC-NPRD-31545-A-TEAM','ACC-QA-31545-A-TEAM','ACC-NPRD-31547-SiteForge','ACC-PROD-31547-SiteForge','ACC-NPRD-31558-R3:DDTS','ACC-PROD-31558-R3:DDTS','ACC-NPRD-31559-R3:SDRS','ACC-PROD-31559-R3:SDRS','ACC-NPRD-31561-R3:EDAUTO','ACC-PROD-31561-R3:EDAUTO','ACC-PROD-31562-R3:SMRT','ACC-NPRD-31563-R3:POSTMAN','ACC-PROD-31563-R3:POSTMAN','ACC-NPRD-31571-BARE (Automated Battery Saving Mode)','ACC-PROD-31571-BARE (Automated Battery Saving Mode)','ACC-NPRD-31586-ATS Flash','ACC-PROD-31586-ATS Flash','ACC-NPRD-31591-RIMDB','ACC-NPRD-31598-YOK','ACC-PROD-31598-YOK','ACC-NPRD-31599-ATTCC','ACC-PROD-31599-ATTCC','ACC-NPRD-31603-OCD','ACC-PROD-31603-OCD','ACC-NPRD-31611-PEDR','ACC-PROD-31611-PEDR','ACC-NPRD-31612-AT&T Business Salesforce Data COE','ACC-PROD-31612-AT&T Business Salesforce Data COE','ACC-NPRD-31619-Northstar-SMT','ACC-NPRD-31619-PC-SMT','ACC-NPRD-31619-PC-SMT-TEST','ACC-NPRD-31619-PC-SMT-TEST-mh257q-7-24','ACC-NPRD-31619-SMT-Opera','ACC-PROD-31619-PC-SMT','ACC-PROD-31619-SMT-Opera','ACC-PROD-31619-SMT-Test','ACC-NPRD-31621-DFIT','ACC-NPRD-31636-BGW-IoT','ACC-PROD-31636-BGW-IoT','ACC-NPRD-31639-FIMS','ACC-PROD-31639-FIMS','ACC-PRD-31643-UnSup','ACC-NPRD-31644-DARP','ACC-PROD-31644-DARP','ACC-NPRD-31648-MIP NG','ACC-PROD-31648-MIP NG','ACC-NPRD-31658-PCCO','ACC-PROD-31658-PCCO-AutoTag','ACC-NPRD-31659-DigitalSignage','ACC-PROD-31659-DigitalSignage','ACC-NPRD-31665-RAINBOW','ACC-PROD-31665-RAINBOW','ACC-NPRD-31666-LTE','ACC-PROD-31666-LTE','ACC-NPRD-31671-NoName','ACC-PROD-31671-NoName','ACC-NPRD-31674-ESPC','ACC-PROD-31674-ESPC','ACC-NPRD-31682-WAMS','ACC-PROD-31682-WAMS','ACC-NPRD-31683-SEAM','ACC-PROD-31683-SEAM','ACC-NPRD-31685-TSB','ACC-PROD-31685-TSB','ACC-NPRD-31698-FBOCA','ACC-PROD-31698-FBOCA','ACC-NPRD-31706-ADOAutomation','ACC-NPRD-31706-PCMST','ACC-PROD-31706-ADOAutomation','ACC-PROD-31706-PCMST','ACC-NPRD-31708-MicroFocus','ACC-QA-31708-MicroFocus','ACC-NPRD-31714-FPSP','ACC-PROD-31714-FPSP','ACC-NPRD-31715-RTI','ACC-PROD-31715-RTI','ACC-NPRD-31720-DQIS','ACC-PROD-31720-DQIS','ACC-NPRD-31721-PONDER','ACC-PROD-31721-PONDER','ACC-NPRD-31734-DP-BRD','ACC-PROD-31734-DP-BRD','ACC-NPRD-31736-ECM NG','ACC-PROD-31736-ECM NG','ACC-NPRD-31738-FORTINET','ACC-PROD-31738-FORTINET','ACC-NPRD-31743-CDODABBLER','ACC-PROD-31743-CDODABBLER','ACC-NPRD-31756-FGI','ACC-PROD-31756-FGI','ACC-NPRD-31760-CCS - CGF Azure','ACC-PROD-31760-CCS - CGF Azure','ACC-NPRD-31763-CERA','ACC-PROD-31763-CERA','ACC-NPRD-31764-GFMO','ACC-PROD-31764-GFMO','ACC-NPRD-31773-iscdemoctr','ACC-NPRD-31790-DTV-FTPSPRD','ACC-PROD-31790-DTV-FTPSPRD','ACC-NPRD-31793-CSOpsWeb','ACC-PROD-31793-CSOpsWeb','ACC-NPRD-31805-FBO Shared DB','ACC-PROD-31805-FBO Shared DB','ACC-NPRD-31806-BMD','ACC-PROD-31806-BMD','ACC-NPRD-31837-EMF','ACC-PROD-31837-EMF','ACC-NPRD-31848-CB','ACC-PROD-31848-CB','ACC-NPRD-31850-AQUA','ACC-QA-31850-AQUA','ACC-NPRD-31860-IMC','ACC-PROD-31860-IMC','ACC-NPRD-31875-ECRS','ACC-PROD-31875-ECRS','ACC-NPRD-31876-IntOS','ACC-NPRD-31880-AGTI-CloudTICMgmt','ACC-PROD-31880-AGTI-CloudTICMgmt','ACC-NPRD-31889-DTV-VIDEO_CMS','ACC-PROD-31889-DTV-VIDEO_CMS','ACC-NPRD-31891-O9PLN','ACC-PROD-31891-O9PLN','ACC-NPRD-31894-wifi-emma','ACC-PROD-31894-wifi-emma','ACC-NPRD-31902-SCOR','ACC-PROD-31902-SCOR','ACC-NPRD-31908-5G and wireline data','ACC-PROD-31908-5G and wireline data','ACC-NPRD-31934-MCR','ACC-PROD-31934-MCR','ACC-NPRD-31936-BITDEV','ACC-NPRD-31945-PEG-INFRA','ACC-PROD-31945-PEG-INFRA','ACC-NPRD-31955-Deadshot','ACC-PROD-31955-Deadshot','ACC-NPRD-31963-MTNS','ACC-PROD-31963-MTNS','ACC-NPRD-31976-CSSAVD','ACC-NPRD-31976-CSSMSphere','ACC-PROD-31976-CSSAVD','ACC-PROD-31976-CSSMSphere','ACC-NPRD-31987-DCORS','ACC-PROD-31987-DCORS','ACC-NPRD-32003-QTT','ACC-PROD-32003-QTT','ACC-NPRD-32007-ABWS-D','ACC-PROD-32007-ABWS-D','ACC-NPRD-32015-CDO_Snowflake_ANT','ACC-PROD-32015-CDO_Snowflake_ANT','ACC-NPRD-32024-CCQT','ACC-PROD-32024-CCQT','ACC-NPRD-32028-Cricket ASR','ACC-PROD-32028-Cricket ASR','ACC-NPRD-32031-OOPA','ACC-PROD-32031-OOPA','ACC-NPRD-32045-LNPDASH','ACC-PROD-32045-LNPDASH','ACC-NPRD-32046-BMSi','ACC-NPRD-32047-DNSPOC','ACC-NPRD-32047-DNSPOC-snowflake','ACC-NPRD-32052-TAXCT','ACC-PROD-32052-TAXCT','ACC-NPRD-32054-RCON','ACC-PROD-32054-RCON','ACC-NPRD-32059-PC-DTT','ACC-PROD-32059-PC-DTT','ACC-NPRD-32068-ABS_AZURE','ACC-NPRD-32068-ABS_AZURE2','ACC-PROD-32068-ABS_AZURE','ACC-PROD-32068-ABS_AZURE2','ACC-NPRD-32080-PC-OCI','ACC-NPRD-32083-COP_DW','ACC-PROD-32083-COP_DW','ACC-NPRD-32088-GSCAP','ACC-PROD-32088-GSCAP','ACC-NPRD-32089-Canopy IoT Platform','ACC-PROD-32089-Canopy IoT Platform','ACC-NPRD-32090-wifi-dns','ACC-PROD-32090-wifi-dns','ACC-NPRD-32091-COICare','ACC-PROD-32091-COICare','ACC-NPRD-32110-eTDM','ACC-QA-32110-eTDM','ACC-NPRD-32111-DICE','ACC-PROD-32111-DICE','ACC-NPRD-32117-Teams E911','ACC-PROD-32117-Teams E911','ACC-NPRD-32125-MCAN-SAT','ACC-NPRD-32128-KRI','ACC-PROD-32128-KRI','ACC-NPRD-32134-IP address management tool','ACC-PROD-32134-IP address management tool','ACC-NPRD-32152-ATLAS-SV','ACC-PROD-32152-ATLAS-SV','ACC-NPRD-32157-GRE-CS','ACC-PROD-32157-GRE-CS','ACC-PROD-32163-DCSTU','ACC-NPRD-32175-DMCP','ACC-PROD-32175-DMCP','ACC-NPRD-32177-CLASH','ACC-PROD-32177-CLASH','ACC-PROD-32182-APEX Labs','ACC-NPRD-32187-BillSuppression','ACC-PROD-32187-BillSuppression','ACC-NPRD-32192-CCSFEXT','ACC-PROD-32192-CCSFEXT','ACC-NPRD-32193-CSMULE','ACC-PROD-32193-CSMULE','ACC-NPRD-32195-CX3D','ACC-PROD-32195-CX3D','ACC-NPRD-32198-SIFT','ACC-PROD-32198-SIFT','ACC-NPRD-32199-SIMSwap','ACC-PROD-32199-SIMSwap','ACC-NPRD-32200-DTV-VCP','ACC-PROD-32200-DTV-VCP','ACC-NPRD-32204-RPERF','ACC-PROD-32204-RPERF','ACC-NPRD-32206-PIM-AZ','ACC-PROD-32206-PIM-AZ','ACC-NPRD-32207-MS-C','ACC-PROD-32207-MS-C','ACC-NPRD-32219-wifi-speed','ACC-PROD-32219-wifi-speed','ACC-NPRD-32230-CSCE-DP D&A','ACC-PROD-32230-CSCE-DP D&A','ACC-NPRD-32255-CCDL','ACC-PROD-32255-CCDL','ACC-NPRD-32260-WOOP','ACC-PROD-32260-WOOP','ACC-NPRD-32267-Guardium','ACC-PROD-32267-Guardium','ACC-PROD-32274-MOVADO','ACC-NPRD-32280-ISTA','ACC-PROD-32280-ISTA','ACC-NPRD-32288 -CSSAdminMgmt','ACC-PROD-32288 -CSSAdminMgmt','ACC-PROD-32289-DATA','ACC-NPRD-32293-DTV-VSS','ACC-PROD-32293-DTV-VSS','ACC-NPRD-32294-AzureDevOps','ACC-PROD-32294-AzureDevOps','ACC-NPRD-32315-DTV-INFRA','ACC-PROD-32315-DTV-INFRA','ACC-NPRD-32321-NEOMULE','ACC-PROD-32321-NEOMULE','ACC-NPRD-32322-ABSMULE','ACC-PROD-32322-ABSMULE','ACC-NPRD-32324-CONMULE','ACC-PROD-32324-CONMULE','ACC-NPRD-32327-ADAS','ACC-PROD-32327-ADAS','ACC-NPRD-32333-CCSSKY','ACC-PROD-32333-CCSSKY','ACC-NPRD-32339-DSAIR','ACC-NPRD-32342-CDSA','ACC-PROD-32342-CDSA','ACC-NPRD-32355-NQP_DATA_WAREHOUSE','ACC-PROD-32355-NQP_DATA_WAREHOUSE','ACC-NPRD-32362-mASCERT','ACC-PROD-32362-mASCERT','ACC-NPRD-32370-FVW','ACC-PROD-32370-FVW','ACC-NPRD-32376-iGEMS Master','ACC-PROD-32376-iGEMS Master','ACC-NPRD-32391-ADW Reporting','ACC-PROD-32391-ADW Reporting','ACC-NPRD-32404-MVNODEV','ACC-PROD-32404-MVNODEV','ACC-NPRD-32409-consumer health insight platform','ACC-NPRD-32413-GPN','ACC-PROD-32413-GPN','ACC-NPRD-32426-Connectivity+ - AI','ACC-PROD-32426-Connectivity+ - AI','ACC-NPRD-32434-Cricket Observe','ACC-PROD-32434-Cricket Observe','ACC-PROD-32450-eProSearch','ACC-NPRD-32501-PC-CHECKR','ACC-PROD-32501-PC-CHECKR','ACC-NPRD-32513-AON-EUAP-AUSFTXNK-2','ACC-NPRD-32513-AON-EUAP-MDTWNJAT-1','ACC-NPRD-32513-AON-SHARED','ACC-NPRD-32513-AON-USE-AUSFTXNK-3','ACC-NPRD-32513-AON-USE-RDMDWAGP-1','ACC-NPRD-32513-AON-USSC-AUSFTXNK-1','ACC-NPRD-32513-AON-USSC-MDTWNJ21-1','ACC-NPRD-32513-AON-USW3-AUSFTXNK-4','ACC-NPRD-32513-AON-USW3-RDMDWAGP-2','ACC-NPRD-32513-AON-USW3-RDMDWAIT-1','ACC-PROD-32513-AON-PREPROD-E2E-SHARED','ACC-PROD-32513-AON-PREPROD-E2E-USE-KGMTNC20-1','ACC-PROD-32513-AON-PREPROD-E2E-USE-NYCMNY54-1','ACC-PROD-32513-AON-PREPROD-MPSL-SHARED','ACC-PROD-32513-AON-PREPROD-MPSL-USE-ATLNGANW-1','ACC-PROD-32513-AON-PREPROD-MPSL-USE-CMBRMA01-1','ACC-PROD-32513-AON-PREPROD-MPSL-USE-NSVLTNMT-1','ACC-PROD-32513-AON-PREPROD-MPSL-USE-NYCMNY54-1','ACC-PROD-32513-AON-PREPROD-MPSL-USE-ORLDFLMA-1','ACC-PROD-32513-AON-PREPROD-MPSL-USSC-DLLSTXTL-1','ACC-PROD-32513-AON-PREPROD-MPSL-USSC-STLSMO09-1','ACC-PROD-32513-AON-PREPROD-USW3-SCRMCA01-1','ACC-PROD-32513-AON-SHARED','ACC-PROD-32513-AON-USE-ATLNGANW-1','ACC-PROD-32513-AON-USE-ATLNGATL-1','ACC-PROD-32513-AON-USE-CMBRMA01-1','ACC-PROD-32513-AON-USE-FTLDFLOV-1','ACC-PROD-32513-AON-USE-KGMTNC20-1','ACC-PROD-32513-AON-USE-MIAMFLCC-1','ACC-PROD-32513-AON-USE-NSVLTNMT-1','ACC-PROD-32513-AON-USE-NYCMNY54-1','ACC-PROD-32513-AON-USE-ORLDFLMA-1','ACC-PROD-32513-AON-USE-WASHDCDT-1','ACC-PROD-32513-AON-USE-WASHDCSW-1','ACC-PROD-32513-AON-USSC-AUSTTXGR-1','ACC-PROD-32513-AON-USSC-CHCGILCL-1','ACC-PROD-32513-AON-USSC-DLLSTXTL-1','ACC-PROD-32513-AON-USSC-DNVRCOMA-1','ACC-PROD-32513-AON-USSC-DTRTMIBA-1','ACC-PROD-32513-AON-USSC-FTWOTXED-1','ACC-PROD-32513-AON-USSC-HSTNTX01-1','ACC-PROD-32513-AON-USSC-KSCYMO09-1','ACC-PROD-32513-AON-USSC-NWORLAMA-1','ACC-PROD-32513-AON-USSC-SNANTXCA-1','ACC-PROD-32513-AON-USSC-STLSMO09-1','ACC-PROD-32513-AON-USW3-LSANCA02-1','ACC-PROD-32513-AON-USW3-OKLDCA03-1','ACC-PROD-32513-AON-USW3-PHNXAZMA-1','ACC-PROD-32513-AON-USW3-PTLDOR62-1','ACC-PROD-32513-AON-USW3-SNDGCA01-1','ACC-PROD-32513-AON-USW3-SNJSCA02-1','ACC-NPRD-32516-CDODBELT','ACC-PROD-32516-CDODBELT','ACC-NPRD-32521-Oriient','ACC-PROD-32521-Oriient','ACC-NPRD-32524-mediapulse','ACC-PROD-32524-mediapulse','ACC-NPRD-32527-wifi-cloud-net','ACC-PROD-32527-wifi-cloud-net','ACC-NPRD-32530-TRT','ACC-PROD-32530-TRT','ACC-NPRD-32537-MTI','ACC-PROD-32537-MTI','ACC-NPRD-32548-wifi-con_db_cache_auth','ACC-PROD-32548-wifi-con_db_cache_auth','ACC-NPRD-32552-SIRA','ACC-PROD-32552-SIRA','ACC-NPRD-32576-INTL-MECM','ACC-PROD-32576-INTL-MECM','ACC-NPRD-32592-TGM','ACC-PROD-32592-TGM','ACC-NPRD-32605-FlexCloud','ACC-PROD-32605-FlexCloud','ACC-NPRD-32610-PSIX-CCWR','ACC-PROD-32610-PSIX-CCWR','ACC-NPRD-32617-MMTARP','ACC-PROD-32617-MMTARP','ACC-NPRD-32622-MSSOPS-FedGov-Mgmt','ACC-PROD-32622-MSSOPS-FedGov-Mgmt','ACC-NPRD-32629-SSM','ACC-PROD-32629-SSM','ACC-NPRD-32651-NEO SI','ACC-PROD-32651-NEO SI','ACC-NPRD-32653-LabOps-DNSManagement','ACC-PROD-32653-LabOps-DNSManagement','ACC-NPRD-32655-NDAC','ACC-PROD-32655-NDAC','ACC-NPRD-32659-MLRNP','ACC-PROD-32659-MLRNP','ACC-NPRD-32661-CSR Carbon Accounting Reporting','ACC-PROD-32661-CSR Carbon Accounting Reporting','ACC-NPRD-32662-Keyfactor','ACC-PROD-32662-KeyFactor','ACC-NPRD-32669-Trinity','ACC-PROD-32669-Trinity','ACC-NPRD-32680-NSSE-1','ACC-NPRD-32680-NSSE-2','ACC-PROD-32680-NSSE','ACC-NPRD-32681-WFOA','ACC-PROD-32681-WFOA','ACC-NPRD-32682-VNFBay','ACC-PROD-32682-VNFBay','ACC-NPRD-32694-AT&T ESG','ACC-PROD-32694-AT&T ESG','ACC-NPRD-32707-cBBT','ACC-PROD-32707-cBBT','ACC-NPRD-32720-iAM','ACC-PROD-32720-iAM','ACC-NPRD-32723-mediaprodtools','ACC-PROD-32723-mediaprodtools','ACC-NPRD-32727-ECA','ACC-PROD-32727-ECA','ACC-NPRD-32730-CQG','ACC-PROD-32730-CQG','ACC-NPRD-32734-SNAP-SANE','ACC-PROD-32734-SNAP-SANE','ACC-NPRD-32758-SANE','ACC-PROD-32758-SANE','ACC-NPRD-32771-LABOPSSYNC','ACC-NPRD-32794-DDAP','ACC-PROD-32794-DDAP','ACC-NPRD-32797-ATCS_FVGW_ELK','ACC-PROD-32797-ATCS_FVGW_ELK','ACC-NPRD-32803-PNARS','ACC-PROD-32803-PNARS','ACC-NPRD-32809-ICSA','ACC-PROD-32809-ICSA','ACC-NPRD-32857-NAP','ACC-PROD-32857-NAP','ACC-NPRD-32858-NCAL CE DB','ACC-PROD-32858-NCAL CE DB','ACC-NPRD-32862-OTTER','ACC-PROD-32862-OTTER','ACC-NPRD-32869-DNI-NET-DEV','ACC-NPRD-32873-PCDA','ACC-PROD-32873-PCDA','ACC-NPRD-32874-VSP','ACC-PROD-32874-VSP','ACC-NPRD-32882-L1-WebApps','ACC-PROD-32882-L1-WebApps','ACC-NPRD-32922-COMO','ACC-PROD-32922-COMO','ACC-NPRD-32933-NEON-NSAS','ACC-PROD-32933-NEON-NSAS','ACC-NPRD-32944-ADSI-CSO','ACC-PROD-32944-ADSI-CSO','ACC-NPRD-32954-MPDM','ACC-PROD-32954-MPDM','ACC-NPRD-32955-MMSDB','ACC-PROD-32955-MMSDB','ACC-NPRD-32960-BDAM','ACC-PROD-32960-BDAM','ACC-NPRD-32978-PSAT','ACC-PROD-32978-PSAT','ACC-NPRD-32986-Teams Plus','ACC-PROD-32986-Teams Plus','ACC-NPRD-32991-NEON-HUB','ACC-NPRD-32991-NEON-SDI','ACC-PROD-32991-NEON-HUB','ACC-PROD-32991-NEON-SDI','ACC-NPRD-32992-RooneyPOC','ACC-NPRD-33009-PC-BDC','ACC-PROD-33009-PC-BDC','ACC-NPRD-33011-SIP','ACC-PROD-33011-SIP','ACC-NPRD-33012-AAMG','ACC-PROD-33012-AAMG','ACC-NPRD-33020-NOPRWM','ACC-PROD-33020-NOPRWM','ACC-NPRD-33021-CSO-DPS','ACC-NPRD-33045-ARDA','ACC-PROD-33045-ARDA','ACC-NPRD-33117-D4Now','ACC-PROD-33117-D4Now','ACC-NPRD-33119-CSO-DP-POC','ACC-PROD-33119-CSO-DP-POC','ACC-NPRD-33152-AzureSharedMTA','ACC-PROD-33152-AzureSharedMTA','ACC-NPRD-33169-ISAAC CSP','ACC-PROD-33169-ISAAC CSP','ACC-NPRD-33212-ADOST','ACC-PROD-33212-ADOST','ACC-NPRD-33370-HVA','ACC-PROD-33370-HVA','ACC-NPRD-33435-CAST','ACC-PROD-33435-CAST','ACC-NPRD-33520-Unified Self-Service','ACC-PROD-33520-Unified Self-Service','ACC-NPRD-33566-B2Bi NG Gateway','ACC-PROD-33566-B2Bi NG Gateway','ACC-NPRD-33606-LabOps-DataWarehouse','ACC-PROD-33606-LabOps-DataWarehouse','ACC-NPRD-33620-BFS','ACC-PROD-33620-BFS','ACC-PROD-33626-PRGST','ACC-NPRD-33636-HARMONY','ACC-PROD-33636-HARMONY','ACC-PROD-33647-DPF','ACC-NPRD-33648-D3P','ACC-PROD-33648-D3P','ACC-NPRD-33674-TAOP','ACC-NPRD-33676-RGMOC','ACC-PROD-33676-RGMOC','ACC-NPRD-33677-GitHub Central','ACC-PROD-33677-GitHub Central','ACC-NPRD-33690-CANVASS','ACC-PROD-33690-CANVASS','ACC-NPRD-33700-DTV-DYNATRC','ACC-PROD-33700-DTV-DYNATRC','ACC-NPRD-33723-PROST','ACC-PROD-33723-PROST','ACC-NPRD-33736-NDOS','ACC-PROD-33736-NDOS','ACC-NPRD-33738-PAM','ACC-PROD-33738-PAM','ACC-NPRD-33750-Insight','ACC-PROD-33750-Insight','ACC-NPRD-33769-Public Sector Large Deal Tracker','ACC-PROD-33769-Public Sector Large Deal Tracker','ACC-NPRD-33807-AZMIDNG','ACC-PROD-33807-AZMIDNG','ACC-NPRD-33818-ABO Dashboard','ACC-PROD-33818-ABO Dashboard','ACC-NPRD-33821-AO-Calc','ACC-PROD-33821-AO-Calc','ACC-NPRD-33839-Quick Quote','ACC-PROD-33839-Quick Quote','ACC-NPRD-33843-Splunk Synthetic','ACC-PROD-33843-Splunk Synthetic','ACC-NPRD-33857-TD-CC','ACC-PROD-33857-TD-CC','ACC-NPRD-33860-wifi-ing','ACC-PROD-33860-wifi-ing','ACC-NPRD-33890-DevEx','ACC-PROD-33890-DevEx','ACC-NPRD-33924-ABD','ACC-NPRD-33932-IDP-CTX-Event-HUB','ACC-PROD-33932-IDP-CTX-Event-HUB','ACC-NPRD-33949-AP-CC','ACC-PROD-33949-AP-CC','ACC-NPRD-33950-BAMP','ACC-PROD-33950-BAMP','ACC-NPRD-33959-SPO','ACC-PROD-33959-SPO','ACC-NPRD-33962-Astrix','ACC-PROD-33962-Astrix','ACC-NPRD-33964-OSS-S','ACC-PROD-33964-OSS-S','ACC-NPRD-34004-DANA','ACC-PROD-34004-DANA','ACC-NPRD-34017-BRICS','ACC-NPRD-34019-COMS','ACC-PROD-34019-COMS','ACC-NPRD-34041-BusOpsDX','ACC-PROD-34041-BusOpsDX','ACC-NPRD-34086-TDEMEA','ACC-PROD-34086-TDEMEA','ACC-NPRD-34107-MTSRA','ACC-PROD-34107-MTSRA','ACC-NPRD-34134-ALEXv2.0','ACC-PROD-34134-ALEXv2.0','ACC-NPRD-34141-Discourse','ACC-PROD-34141-Discourse','ACC-NPRD-34143-NTL','ACC-PROD-34143-NTL','ACC-NPRD-34151-ASP','ACC-PROD-34151-ASP','ACC-NPRD-34153-FinInsights','ACC-PROD-34153-FinInsights','ACC-NPRD-34174-RepoSense','ACC-PROD-34174-RepoSense','ACC-NPRD-34182-UIS','ACC-PROD-34182-UIS','ACC-NPRD-34183-LDW - C','ACC-PROD-34183-LDW - C','ACC-NPRD-34185-OAST','ACC-PROD-34185-OAST','ACC-NPRD-34190-MBIZ','ACC-PROD-34190-MBIZ','ACC-NPRD-34200-ContactHub','ACC-PROD-34200-ContactHub','ACC-NPRD-34210-IDP-Cloud-PCI','ACC-PROD-34210-IDP-Cloud-PCI','ACC-NPRD-31204-Azure RDW - EDW','ACC-NPRD-34236-DPG-eCARS','ACC-PROD-31204-Azure RDW - EDW','ACC-PROD-34236-DPG-eCARS','ACC-NPRD-34246-Maestro','ACC-PROD-34246-Maestro','ACC-NPRD-34274-EDF-WF','ACC-PROD-34274-EDF-WF','ACC-NPRD-34276-DSPM Cyera','ACC-PROD-34276-DSPM Cyera','ACC-NPRD-34277-SoftwareSymposium','ACC-PROD-34277-SoftwareSymposium','ACC-NPRD-34286-GenAIAux','ACC-PROD-34286-GenAIAux','ACC-NPRD-34295-ACG','ACC-PROD-34295-ACG','ACC-NPRD-34305-EIAP','ACC-NPRD-34313-CCS RCDP','ACC-PROD-34313-CCS RCDP','ACC-NPRD-34314-SCAA','ACC-PROD-34314-SCAA','ACC-NPRD-34315-PaWIIS','ACC-PROD-34315-PaWIIS','ACC-NPRD-34324-QSP','ACC-PROD-34324-QSP','ACC-NPRD-34351-CorporateArchives','ACC-NPRD-34364-GWS EHS DATA SYSTEMS','ACC-PROD-34364-GWS EHS DATA SYSTEMS','ACC-NPRD-34444-CLEAR','ACC-PROD-34444-CLEAR','ACC-NPRD-34447-Securiti.ai','ACC-PROD-34447-Securiti.ai','ACC-NPRD-34482-innv_studio_int','ACC-NPRD-34505-FNDR','ACC-PROD-34505-FNDR','ACC-NPRD-34506-Bastion-SharedSvcs','ACC-PROD-34506-Bastion-SharedSvcs','ACC-NPRD-34518-connectedai','ACC-NPRD-34528-UIR','ACC-PROD-34528-UIR','ACC-NPRD-34536-GCA','ACC-PROD-34536-GCA','ACC-NPRD-35110-NOVAXP','ACC-PROD-35110-NOVAXP','ACC-NPRD-35272-Nexus','ACC-PROD-35272-Nexus','ACC-NPRD-35276-DAR','ACC-PROD-35276-DAR','ACC-NPRD-35412-CarrierLink','ACC-PROD-35412-CarrierLink','ACC-NPRD-35621-FNC 2.0','ACC-PROD-35621-FNC 2.0','ACC-NPRD-35639-ContractAI','ACC-PROD-35639-ContractAI','ACC-NPRD-35644-PersonalAI','ACC-NPRD-35691-MOCHI','ACC-PROD-35691-MOCHI','ACC-NPRD-35735-DATASTACK','ACC-PROD-35735-DATASTACK','ACC-NPRD-35740-Marvel','ACC-PROD-35740-Marvel','ACC-NPRD-35807-DPG-CIMCDR','ACC-PROD-35807-DPG-CIMCDR','ACC-NPRD-35824-FDOL','ACC-NPRD-35943-FraudGuard'"""
+    # subscription_name = """'ACC-PROD-33962-Astrix','ACC-PROD-33962-Astrix','ACC-NPRD-33962-Astrix'"""
+    logger.info("Fetch Subscription id for a subscription name")
+    subscription_df = azure_data_utility.fetch_subscription_df(subscription_name, reprocess_flag=False)
+    process_date = datetime.now().strftime("%Y-%m-%d")
+    with open("rt_values.json", "rb") as fl:
+        data = json.load(fl)
+    rt_values_df = pd.DataFrame(data)
+    rt_values_df['mots_id'] = rt_values_df['mots_id'].astype(int)
+    iaas_db_dr_configuration_fetcher = IaasDbDRConfigurationFetcher('Ask_DR_Project', sf_con,
+                                                                           subscription_df, process_date, rt_values_df)
+    final_df = iaas_db_dr_configuration_fetcher.fetch_data()
+    final_df.to_csv("final.csv")
+    logger.info("Close Snowflake database connection")
+    sf_con.conn.close()
+
+
+if __name__ == '__main__':
+    logger = logging.getLogger('Ask_DR_Project')
+    logger.setLevel(10)
+    stream_handler = logging.StreamHandler()
+    stream_handler.setLevel(10)
+    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+    main()
